@@ -1,0 +1,29 @@
+{
+  "latitude": 56.922554,
+  "longitude": 24.037231,
+  "generationtime_ms": 0.040411949157714844,
+  "utc_offset_seconds": 10800,
+  "timezone": "Europe/Riga",
+  "timezone_abbreviation": "GMT+3",
+  "elevation": 12.0,
+  "daily_units": {
+    "time": "iso8601",
+    "shortwave_radiation_sum": "MJ/m\u00b2",
+    "sunshine_duration": "s",
+    "cloud_cover_mean": "%"
+  },
+  "daily": {
+    "time": [
+      "2026-05-10"
+    ],
+    "shortwave_radiation_sum": [
+      6.04
+    ],
+    "sunshine_duration": [
+      245.22
+    ],
+    "cloud_cover_mean": [
+      100
+    ]
+  }
+}

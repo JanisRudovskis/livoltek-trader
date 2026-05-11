@@ -1,0 +1,52 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+
+# uv
+.venv/
+.uv-cache/
+
+# Playwright
+.playwright/
+playwright-report/
+test-results/
+**/playwright/.cache/
+
+# Persistent browser session storage (cookies, login state)
+storage_state.json
+browser-data/
+
+# Personal data — never commit (consumption, production exports, etc.)
+data/
+
+# Logs
+*.log
+logs/
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# OS
+Thumbs.db
+desktop.ini
