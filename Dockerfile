@@ -16,7 +16,9 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 # Install Playwright Chromium + OS-level browser dependencies. This is the
 # heavy layer (~400 MB) — keep it stable so changes to source don't rebuild it.
-RUN uv run playwright install --with-deps chromium
+# Call the venv binary directly so uv doesn't try to install our package
+# (the source hasn't been COPYed yet — that happens after, to preserve caching).
+RUN .venv/bin/playwright install --with-deps chromium
 
 # Install our package on top.
 COPY src/ ./src/
