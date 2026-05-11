@@ -305,3 +305,62 @@ def test_plan_day_without_pv_forecast_behaves_as_before(settings):
     hourly = _strong_spread_hourly(9)
     plan = plan_day(hourly, date(2026, 5, 9), settings, pv_forecast=None)
     assert plan.cycles, "with no forecast, fall back to grid-only logic"
+
+
+# --- max-six-cycle cap ------------------------------------------------------
+
+
+def _cycle_hours(c: CyclePair) -> set[datetime]:
+    hours: set[datetime] = set()
+    for w in (c.charge, c.discharge):
+        h = w.start
+        while h < w.end:
+            hours.add(h)
+            h = h + timedelta(hours=1)
+    return hours
+
+
+def test_plan_day_caps_at_max_cycles_per_day_six(settings):
+    # 12 two-hour blocks alternating cheap/dear lets us fit exactly 6 cycles.
+    settings = settings.model_copy(update={"max_cycles_per_day": 6})
+    prices = [0.0] * 24
+    for h in range(24):
+        prices[h] = 0.05 if (h // 2) % 2 == 0 else 0.80
+    hourly = _hourly_series(9, prices)
+    plan = plan_day(hourly, date(2026, 5, 9), settings)
+    assert len(plan.cycles) == 6, f"expected 6 cycles, got {len(plan.cycles)}"
+    starts = [c.charge.start for c in plan.cycles]
+    assert starts == sorted(starts), "cycles must be returned in time order"
+    used: set[datetime] = set()
+    for c in plan.cycles:
+        for h in _cycle_hours(c):
+            assert h not in used, f"overlap detected at {h}"
+            used.add(h)
+
+
+def test_plan_day_cap_can_be_lower_than_six(settings):
+    settings = settings.model_copy(update={"max_cycles_per_day": 3})
+    prices = [0.0] * 24
+    for h in range(24):
+        prices[h] = 0.05 if (h // 2) % 2 == 0 else 0.80
+    hourly = _hourly_series(9, prices)
+    plan = plan_day(hourly, date(2026, 5, 9), settings)
+    assert len(plan.cycles) == 3
+
+
+def test_plan_day_greedy_drops_lower_profit_cycles_competing_for_same_window(settings):
+    # Only one dear window; multiple cheap windows compete for it. Greedy
+    # should pick the cycle with the cheapest charge (highest spread) and
+    # discard the rest — no other profitable pairing remains.
+    settings = settings.model_copy(update={"max_cycles_per_day": 6})
+    prices = [0.50] * 24
+    prices[2] = 0.05
+    prices[3] = 0.05   # cheapest charge candidate
+    prices[20] = 0.90
+    prices[21] = 0.90  # the only dear window
+    hourly = _hourly_series(9, prices)
+    plan = plan_day(hourly, date(2026, 5, 9), settings)
+    assert len(plan.cycles) == 1
+    chosen = plan.cycles[0]
+    assert chosen.charge.start.hour == 2
+    assert chosen.discharge.start.hour == 20

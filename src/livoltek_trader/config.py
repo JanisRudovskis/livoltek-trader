@@ -15,13 +15,13 @@ class Settings(BaseSettings):
     elering_region: str = Field(default="lv")
     elering_timeout_s: float = Field(default=15.0)
 
-    battery_capacity_kwh: float = Field(default=5.12, gt=0.0)
+    battery_capacity_kwh: float = Field(default=10.24, gt=0.0)
     round_trip_efficiency: float = Field(default=0.90, gt=0.0, le=1.0)
     battery_price_eur: float = Field(default=3000.0, ge=0.0)
     battery_cycle_life: int = Field(default=6000, gt=0)
-    max_cycles_per_day: int = Field(default=2, ge=0)
+    max_cycles_per_day: int = Field(default=6, ge=0, le=6)
     hours_per_cycle: int = Field(default=2, ge=1)
-    min_net_profit_per_cycle_eur: float = Field(default=0.10)
+    min_net_profit_per_cycle_eur: float = Field(default=0.25)
 
     open_meteo_base_url: str = Field(default="https://api.open-meteo.com/v1")
     pv_lat: float = Field(default=56.918)
@@ -29,6 +29,18 @@ class Settings(BaseSettings):
     pv_kwh_per_mj_m2: float = Field(default=2.98, gt=0.0)
     expected_daily_load_kwh: float = Field(default=22.0, gt=0.0)
     open_meteo_timeout_s: float = Field(default=15.0)
+
+    ntfy_base_url: str = Field(default="https://ntfy.sh")
+    ntfy_topic: str = Field(default="")
+    ntfy_token: str = Field(default="")
+    ntfy_timeout_s: float = Field(default=10.0)
+
+    livoltek_portal_url: str = Field(default="https://evs.livoltek-portal.com/#/")
+    livoltek_username: str = Field(default="")
+    livoltek_password: str = Field(default="")
+    livoltek_storage_state_path: str = Field(default="browser-data/storage_state.json")
+    livoltek_browser_timeout_s: float = Field(default=30.0, gt=0.0)
+    livoltek_headless: bool = Field(default=False)
 
     @property
     def wear_cost_per_cycle_eur(self) -> float:

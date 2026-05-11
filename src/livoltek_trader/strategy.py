@@ -111,23 +111,39 @@ def _build_cycle(
     )
 
 
+def _hours_of_cycle(cycle: CyclePair) -> set[datetime]:
+    """Return every clock hour occupied by either the charge or discharge window."""
+    hours: set[datetime] = set()
+    for window in (cycle.charge, cycle.discharge):
+        h = window.start
+        while h < window.end:
+            hours.add(h)
+            h += timedelta(hours=1)
+    return hours
+
+
 def plan_day(
     hourly: list[HourlyPrice],
     target_date: date,
     settings: Settings | None = None,
     pv_forecast: PvForecast | None = None,
 ) -> DailyPlan:
-    """Find the most profitable set of up to N cycles for the day.
+    """Pick the best disjoint set of up to `max_cycles_per_day` cycles for the day.
 
-    Brute-forces the (charge, discharge) block pairs and picks the
-    combination with the highest total net profit, subject to:
-    - charge starts before discharge within a cycle
-    - at most `max_cycles_per_day` cycles, in time order, non-overlapping
-    - each cycle nets at least `min_net_profit_per_cycle_eur`
+    Each cycle is a (charge_window, discharge_window) pair with discharge
+    starting at or after the charge ends; net profit (gross − wear) must clear
+    `min_net_profit_per_cycle_eur`. Candidates are sorted by net profit
+    descending and selected greedily — the highest-profit cycle that doesn't
+    overlap (hour-wise) any already chosen cycle is added, up to the cap.
 
-    If `pv_forecast` says expected PV meets or exceeds expected daily load,
-    the day is skipped: the battery will be filled from PV surplus for free,
-    so any grid-charge cycle would waste battery wear without arbitrage value.
+    If `pv_forecast` says expected PV meets or exceeds expected daily load
+    closely enough that grid imports fall below one cycle's output, the day
+    is skipped: the battery will fill from PV surplus for free and any
+    grid-charge cycle would waste wear without arbitrage value.
+
+    The Livoltek portal supports at most 6 schedule slots; with the
+    Charge-only approach (Self-use handles discharge implicitly), one cycle
+    maps to one Charge slot. `max_cycles_per_day` is bounded at 6 to match.
     """
     settings = settings or get_settings()
 
@@ -165,39 +181,18 @@ def plan_day(
 
     blocks = _build_blocks(hourly, settings.hours_per_cycle)
     threshold = settings.min_net_profit_per_cycle_eur
-    best_plan: list[CyclePair] = []
-    best_profit = float("-inf")
 
-    for c1 in blocks:
-        for d1 in blocks:
-            if d1.start < c1.end:
+    candidates: list[CyclePair] = []
+    for c in blocks:
+        for d in blocks:
+            if d.start < c.end:
                 continue
-            cycle1 = _build_cycle(c1, d1, settings)
-            if cycle1.net_profit_eur < threshold:
+            cycle = _build_cycle(c, d, settings)
+            if cycle.net_profit_eur < threshold:
                 continue
+            candidates.append(cycle)
 
-            if cycle1.net_profit_eur > best_profit:
-                best_profit = cycle1.net_profit_eur
-                best_plan = [cycle1]
-
-            if settings.max_cycles_per_day < 2:
-                continue
-
-            for c2 in blocks:
-                if c2.start < d1.end:
-                    continue
-                for d2 in blocks:
-                    if d2.start < c2.end:
-                        continue
-                    cycle2 = _build_cycle(c2, d2, settings)
-                    if cycle2.net_profit_eur < threshold:
-                        continue
-                    total = cycle1.net_profit_eur + cycle2.net_profit_eur
-                    if total > best_profit:
-                        best_profit = total
-                        best_plan = [cycle1, cycle2]
-
-    if not best_plan:
+    if not candidates:
         return DailyPlan(
             target_date=target_date,
             cycles=[],
@@ -205,9 +200,26 @@ def plan_day(
             total_net_profit_eur=0.0,
         )
 
+    candidates.sort(
+        key=lambda c: (-c.net_profit_eur, c.charge.start, c.discharge.start)
+    )
+
+    chosen: list[CyclePair] = []
+    used_hours: set[datetime] = set()
+    for cycle in candidates:
+        if len(chosen) >= settings.max_cycles_per_day:
+            break
+        cycle_hours = _hours_of_cycle(cycle)
+        if cycle_hours.isdisjoint(used_hours):
+            chosen.append(cycle)
+            used_hours.update(cycle_hours)
+
+    chosen.sort(key=lambda c: c.charge.start)
+    total_profit = sum(c.net_profit_eur for c in chosen)
+
     return DailyPlan(
         target_date=target_date,
-        cycles=best_plan,
+        cycles=chosen,
         skipped_reason=None,
-        total_net_profit_eur=best_profit,
+        total_net_profit_eur=total_profit,
     )

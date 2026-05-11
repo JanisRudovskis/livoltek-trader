@@ -1,0 +1,38 @@
+# Secrets — never copy into image
+.env
+.env.*
+!.env.example
+
+# Python build artefacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# Local venv + uv cache
+.venv/
+.uv-cache/
+
+# Tests, scripts, dev tooling — not needed at runtime
+tests/
+scripts/
+.pytest_cache/
+
+# Personal data + browser state — never ship
+data/
+browser-data/
+*.log
+logs/
+
+# Git + IDE noise
+.git/
+.gitignore
+.gitattributes
+.idea/
+.vscode/
+.python-version
+
+# Docs (optional, keep small)
+docs/exploration/
