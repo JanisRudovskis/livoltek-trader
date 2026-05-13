@@ -113,12 +113,14 @@ class LivoltekClient:
         )
 
         await self._resolve_tips_popup()
+        await self._dismiss_announcement_dialog()
 
         if await self._reached_home():
             log.info("livoltek.login.session_restored")
             return
 
         await self._dismiss_cookies()
+        await self._dismiss_announcement_dialog()
         if self.EU_HOST not in page.url:
             await self._switch_to_eu_server_if_needed()
         await self._fill_credentials_and_submit()
@@ -182,9 +184,43 @@ class LivoltekClient:
         await dialog.get_by_role("button", name=button).click()
         log.info("livoltek.tips_popup.resolved", button=button, body=body[:80])
 
+    async def _dismiss_announcement_dialog(self, timeout_ms: int = 3000) -> None:
+        """Close any visible Element UI `el-dialog__wrapper` (maintenance notices, EULA, etc.).
+
+        The portal occasionally pops up these announcements between sessions.
+        They have no stable aria-label, so we identify them by class and click
+        the primary (Confirm) button via JS. Different DOM family than the Tips
+        MessageBox handled by `_resolve_tips_popup`.
+        """
+        try:
+            result = await self.page.evaluate(
+                """() => {
+                    const wrappers = Array.from(document.querySelectorAll('.el-dialog__wrapper'));
+                    for (const w of wrappers) {
+                        if (window.getComputedStyle(w).display === 'none') continue;
+                        const btn = w.querySelector('.el-button--primary')
+                            || w.querySelector('button[type="button"]');
+                        if (btn) {
+                            btn.click();
+                            return { dismissed: true, text: (w.innerText || '').slice(0, 120) };
+                        }
+                    }
+                    return { dismissed: false };
+                }"""
+            )
+            if result.get("dismissed"):
+                log.info(
+                    "livoltek.announcement.dismissed",
+                    preview=result.get("text", ""),
+                )
+                await asyncio.sleep(0.5)
+        except Exception as exc:
+            log.warning("livoltek.announcement.dismiss_error", error=str(exc))
+
     async def _fill_credentials_and_submit(self) -> None:
         page = self.page
         await self._resolve_tips_popup(timeout_ms=500)
+        await self._dismiss_announcement_dialog(timeout_ms=500)
         await page.get_by_placeholder("Account or Email").fill(
             self._settings.livoltek_username
         )
@@ -276,10 +312,26 @@ class LivoltekClient:
 
         if save:
             await page.get_by_role("button", name="Save Params.").first.click()
-            await asyncio.sleep(3.0)
+            await self._verify_save_toast()
             log.info("livoltek.apply_schedule.saved")
         else:
             log.info("livoltek.apply_schedule.dry_run_form_filled")
+
+    async def _verify_save_toast(self, timeout_ms: int = 8000) -> None:
+        """Wait for the green success toast after Save Params; warn otherwise.
+
+        The portal renders an `.el-message--success` toast saying
+        'The instruction was issued successfully!' when the command reaches
+        the inverter. If we don't see it, the Save click didn't actually
+        commit — log a warning so it shows up in cron output.
+        """
+        try:
+            await self.page.locator(".el-message--success").first.wait_for(
+                state="visible", timeout=timeout_ms
+            )
+            log.info("livoltek.save.toast_confirmed")
+        except PlaywrightTimeoutError:
+            log.warning("livoltek.save.no_success_toast_seen")
 
     async def _set_tou_enabled(self, enabled: bool) -> None:
         page = self.page
@@ -337,38 +389,86 @@ class LivoltekClient:
         await field.press("Tab")
 
     async def _select_strategy(self, slot_idx: int, label: str) -> None:
-        strategy_input = self.page.locator(
+        """Open the slot's strategy dropdown and pick an EXACT-text option.
+
+        Critical: the option list is Charge / Discharge / Stop / Without a
+        strategy. `:has-text("Charge")` is a substring match — would also
+        match "Discharge" and silently pick the wrong row. We do the exact
+        match in JS to avoid Playwright selector quirks.
+        """
+        page = self.page
+        strategy_input = page.locator(
             'input[placeholder="Please Select "]'
         ).nth(slot_idx)
         await strategy_input.click()
-        await self.page.locator(
-            f'.el-select-dropdown__item:has-text("{label}")'
-        ).last.click()
+        await asyncio.sleep(0.3)
+        clicked = await page.evaluate(
+            """(label) => {
+                const items = Array.from(document.querySelectorAll('.el-select-dropdown__item'));
+                for (const item of items) {
+                    if (window.getComputedStyle(item).display === 'none') continue;
+                    const r = item.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) continue;
+                    if ((item.textContent || '').trim() === label) {
+                        item.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+            label,
+        )
+        if not clicked:
+            raise LivoltekError(
+                f"strategy option '{label}' not found in dropdown for slot {slot_idx}"
+            )
 
     async def _set_slot_weekday(self, slot_idx: int, target_weekday: str) -> None:
-        """Open the Nth slot's weekday picker and check only `target_weekday`."""
+        """Open the Nth slot's weekday picker and check only `target_weekday`.
+
+        The picker is a Livoltek-custom component (NOT Element UI el-checkbox):
+        each day is a `<label class="weekday-picker__checkbox-label">` wrapping
+        an `<input type="checkbox" value="0..6">` where the value matches
+        Python `datetime.weekday()` (Mon=0, Sun=6). The component's reactive
+        state only updates on real PointerEvent clicks — JS `.click()` on the
+        input or label silently toggles the DOM but doesn't propagate to Vue.
+        We use Playwright's native click() which dispatches a real event.
+        """
         page = self.page
+        target_idx = _WEEKDAY_LABELS.index(target_weekday)
         picker_tag = page.locator(".weekday-picker__tags").nth(slot_idx)
         await picker_tag.click()
         await asyncio.sleep(0.4)
 
-        await page.evaluate(
-            """(target) => {
-                const labels = ['Mon.','Tue.','Wed.','Thu.','Fri.','Sat.','Sun.'];
-                const checkboxes = Array.from(document.querySelectorAll('.el-checkbox'));
-                for (const cb of checkboxes) {
-                    const lblEl = cb.querySelector('.el-checkbox__label');
-                    if (!lblEl) continue;
-                    const lbl = lblEl.textContent.trim();
-                    if (!labels.includes(lbl)) continue;
-                    const r = cb.getBoundingClientRect();
-                    if (r.width === 0 || r.height === 0) continue;
-                    const isChecked = cb.classList.contains('is-checked');
-                    const want = (lbl === target);
-                    if (isChecked !== want) cb.click();
-                }
-            }""",
-            target_weekday,
+        dropdown = page.locator(".weekday-picker__dropdown").last
+        labels = dropdown.locator("label.weekday-picker__checkbox-label")
+        count = await labels.count()
+        if count != 7:
+            raise LivoltekError(
+                f"weekday picker for slot {slot_idx} has {count} labels, expected 7"
+            )
+
+        clicked: list[dict] = []
+        for i in range(count):
+            label_el = labels.nth(i)
+            input_el = label_el.locator('input[type="checkbox"]')
+            val_str = await input_el.get_attribute("value")
+            if val_str is None:
+                continue
+            idx = int(val_str)
+            is_checked = await input_el.is_checked()
+            want = idx == target_idx
+            if is_checked != want:
+                await label_el.click()
+                clicked.append({"idx": idx, "wasChecked": is_checked})
+                await asyncio.sleep(0.05)
+
+        log.info(
+            "livoltek.weekday_picker.attempt",
+            slot=slot_idx,
+            target=target_weekday,
+            target_idx=target_idx,
+            clicked=clicked,
         )
         await page.locator("body").click(position={"x": 10, "y": 200})
         await asyncio.sleep(0.3)
