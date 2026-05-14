@@ -20,7 +20,7 @@ import structlog
 
 from livoltek_trader.config import Settings, get_settings
 from livoltek_trader.elering import ElerinAPIError, fetch_day_ahead
-from livoltek_trader.livoltek import LivoltekClient, LivoltekError
+from livoltek_trader.livoltek import LivoltekClient
 from livoltek_trader.notify import (
     NtfyClient,
     NtfyError,
@@ -99,8 +99,16 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
             await client.login()
             await client.navigate_to_system_mode()
             await client.apply_schedule(plan, save=True)
-    except LivoltekError as exc:
-        log.error("main.portal_failed", error=str(exc))
+    except Exception as exc:
+        # Catch broadly: Playwright timeouts, network errors, etc. inherit from
+        # Exception but NOT from LivoltekError. Without this catch they would
+        # escape asyncio.run(), kill the cron with no ntfy, and leave only a
+        # bare "app crashed" line in Railway logs.
+        log.exception(
+            "main.portal_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         title, body, prio = format_error_message("portal", exc)
         await _try_notify(ntfy, body, title=title, priority=prio, tags=["warning"])
         return 1
