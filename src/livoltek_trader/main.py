@@ -1,9 +1,13 @@
 """Daily entry point: fetch prices and PV forecast, plan, notify, optionally apply.
 
 Usage:
-    livoltek-trader                       # dry-run for today (compute + notify, no portal write)
+    livoltek-trader                       # dry-run for TOMORROW (Riga local)
     livoltek-trader --execute             # full pipeline with portal Save
     livoltek-trader --date 2026-05-12     # plan for a specific date
+
+Default target is the next calendar day in Riga local time — we run the
+cron at 22:30 Riga the evening before, so by then Nord Pool has published
+tomorrow's prices and the trader can write the schedule to the inverter.
 
 Default is dry-run for safety. `--execute` is required to actually push the
 schedule to the inverter.
@@ -14,9 +18,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import structlog
+
+RIGA_TZ = ZoneInfo("Europe/Riga")
 
 from livoltek_trader.config import Settings, get_settings
 from livoltek_trader.elering import ElerinAPIError, fetch_day_ahead
@@ -37,7 +44,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="livoltek-trader")
     p.add_argument(
         "--date",
-        help="Target date YYYY-MM-DD (default: today)",
+        help="Target date YYYY-MM-DD (default: tomorrow Riga-local)",
     )
     p.add_argument(
         "--execute",
@@ -48,6 +55,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _default_target_date() -> date:
+    """Tomorrow's calendar date in Riga local time.
+
+    The cron fires at 22:30 Riga (~19:30 UTC summer). By then Nord Pool
+    has published the next day's prices, so we plan for tomorrow. Use
+    Riga local — not UTC — so a 22:30 Riga run during DST doesn't
+    accidentally pick "today" via UTC's rollover lagging Riga's.
+    """
+    return (datetime.now(RIGA_TZ).date() + timedelta(days=1))
+
+
 async def _try_notify(ntfy: NtfyClient, *args, **kwargs) -> None:
     try:
         await ntfy.send(*args, **kwargs)
@@ -56,7 +74,9 @@ async def _try_notify(ntfy: NtfyClient, *args, **kwargs) -> None:
 
 
 async def _run(args: argparse.Namespace, settings: Settings) -> int:
-    target_date = date.fromisoformat(args.date) if args.date else date.today()
+    target_date = (
+        date.fromisoformat(args.date) if args.date else _default_target_date()
+    )
     log.info(
         "main.start",
         target_date=target_date.isoformat(),

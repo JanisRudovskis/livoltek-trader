@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import AsyncExitStack
-from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -296,21 +295,23 @@ class LivoltekClient:
             log.info("livoltek.apply_schedule.skip_day", reason=plan.skipped_reason)
         else:
             await self._set_tou_enabled(True)
-            today_weekday = _WEEKDAY_LABELS[
-                datetime.now(RIGA_TZ).weekday()
-            ]
+            # Use the PLAN's weekday, not "now". The cron runs the evening
+            # before the trading day, so `datetime.now().weekday()` would
+            # be off by one and the slot would fire today instead of
+            # tomorrow.
+            target_weekday = _WEEKDAY_LABELS[plan.target_date.weekday()]
 
             slot_idx = 0
             if plan.stop_window is not None:
                 await self._fill_stop_slot(
-                    slot_idx, plan.stop_window, today_weekday
+                    slot_idx, plan.stop_window, target_weekday
                 )
                 slot_idx += 1
 
             for cycle in plan.cycles:
                 if slot_idx >= 6:
                     break
-                await self._fill_charge_slot(slot_idx, cycle, today_weekday)
+                await self._fill_charge_slot(slot_idx, cycle, target_weekday)
                 slot_idx += 1
 
             for clear_idx in range(slot_idx, 6):
@@ -320,7 +321,7 @@ class LivoltekClient:
                 "livoltek.apply_schedule.filled",
                 cycles=len(plan.cycles),
                 stop_window=plan.stop_window is not None,
-                weekday=today_weekday,
+                weekday=target_weekday,
             )
 
         if save:

@@ -6,7 +6,7 @@
   },
   "deploy": {
     "startCommand": "uv run livoltek-trader --execute",
-    "cronSchedule": "30 22 * * *",
+    "cronSchedule": "30 19 * * *",
     "restartPolicyType": "NEVER"
   }
 }
