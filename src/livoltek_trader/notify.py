@@ -15,7 +15,7 @@ import httpx
 
 from livoltek_trader.config import Settings, get_settings
 from livoltek_trader.solar import PvForecast
-from livoltek_trader.strategy import CyclePair, DailyPlan, HourlyPrice
+from livoltek_trader.strategy import DailyPlan, HourlyPrice
 
 RIGA_TZ = ZoneInfo("Europe/Riga")
 
@@ -89,73 +89,6 @@ def _fmt_local(dt) -> str:
     return dt.astimezone(RIGA_TZ).strftime("%H:%M")
 
 
-def _format_day_context(
-    pv_forecast: PvForecast | None,
-    hourly_prices: list[HourlyPrice] | None,
-    settings: Settings | None,
-) -> list[str]:
-    lines: list[str] = []
-    if pv_forecast is not None:
-        lines.append(
-            f"PV prognoze: {pv_forecast.expected_kwh:.1f} kWh "
-            f"(mākoņu segums {pv_forecast.cloud_cover_pct:.0f}%)"
-        )
-    if settings is not None:
-        load = settings.expected_daily_load_kwh
-        lines.append(f"Paredzamais patēriņš: {load:.0f} kWh")
-        if pv_forecast is not None:
-            gap = max(0.0, load - pv_forecast.expected_kwh)
-            lines.append(f"Tīkla imports paredzami: {gap:.1f} kWh")
-    if hourly_prices:
-        prices = [h.eur_per_kwh for h in hourly_prices]
-        spread = max(prices) - min(prices)
-        lines.append(
-            f"Cenu diapazons: {min(prices):.4f}–{max(prices):.4f} €/kWh "
-            f"(spread {spread:.4f})"
-        )
-    return lines
-
-
-def _format_cycle_block(
-    cycle: CyclePair, idx: int, total: int
-) -> list[str]:
-    prefix = f"Cikls {idx}: " if total > 1 else ""
-    return [
-        f"{prefix}lādē no tīkla {_fmt_local(cycle.charge.start)}–"
-        f"{_fmt_local(cycle.charge.end)} par "
-        f"{cycle.charge.avg_eur_per_kwh:.4f} €/kWh (lētākais brīdis)",
-        f"  Mājsaimniecība izlādēs {_fmt_local(cycle.discharge.start)}–"
-        f"{_fmt_local(cycle.discharge.end)} par "
-        f"{cycle.discharge.avg_eur_per_kwh:.4f} €/kWh, aiztaupot grid importu "
-        f"par šo cenu.",
-        f"  Bruto €{cycle.gross_revenue_eur:.2f} − nodilums "
-        f"€{cycle.wear_cost_eur:.2f} = tīrais €{cycle.net_profit_eur:.2f}",
-    ]
-
-
-def _explain_skip(reason: str) -> str | None:
-    if "PV forecast" in reason and "below one cycle output" in reason:
-        return (
-            "PV ražos vairāk par patēriņu — baterija piepildīsies no saules bez "
-            "maksas, un mājsaimniecība dārgajās stundās izmantos pati šo "
-            "uzlādi. Tīkla uzlāde tikai tērētu cikla nodilumu bez ietaupījuma."
-        )
-    if "no cycle nets at least" in reason:
-        return (
-            "Šodien cenu spread ir pārāk līdzens — neviens cikls nepārsniedz "
-            "minimālo neto peļņas slieksni pēc baterijas nodiluma izmaksu "
-            "(€0.50/cikls) atskaitīšanas."
-        )
-    if "max_cycles_per_day is 0" in reason:
-        return "Automātiskā tirdzniecība ir manuāli atslēgta konfigurācijā."
-    if "not enough hourly data" in reason:
-        return (
-            "Šodienai trūkst stundu cenu datu (iespējams, Nord Pool publicēšanas "
-            "kavēšanās vai datu pārklājums)."
-        )
-    return None
-
-
 def format_plan_message(
     plan: DailyPlan,
     *,
@@ -163,43 +96,50 @@ def format_plan_message(
     hourly_prices: list[HourlyPrice] | None = None,
     settings: Settings | None = None,
 ) -> tuple[str, str, list[str]]:
-    """Render a daily plan as (title, body, tags) in Latvian.
+    """Render a daily plan as (title, body, tags) — minimal slot listing.
 
-    When pv_forecast / hourly_prices / settings are supplied, the body
-    includes a day-context preamble (PV forecast, expected load, price
-    range) and a per-cycle reasoning block. Times are Riga local.
+    Body shows only the PV forecast and a flat list of scheduled slots
+    (start–end + strategy, Riga local time). Skip days show "ToU
+    izslēgts". `hourly_prices` and `settings` are accepted for backward
+    compatibility but no longer used.
     """
-    if plan.skipped_reason:
-        title = f"Livoltek {plan.target_date}: izlaiž"
+    has_stop = plan.stop_window is not None
+    has_cycles = bool(plan.cycles)
+
+    if not has_stop and not has_cycles:
+        title = f"Livoltek {plan.target_date}: ToU izslēgts"
+        tags = ["sunny"]
+    elif has_stop and not has_cycles:
+        title = f"Livoltek {plan.target_date}: Stop"
+        tags = ["sunny"]
+    elif has_stop and has_cycles:
+        n = len(plan.cycles)
+        word = "cikls" if n == 1 else "cikli"
+        title = f"Livoltek {plan.target_date}: Stop + {n} {word}"
+        tags = ["battery"]
     else:
         n = len(plan.cycles)
-        cycle_word = "cikls" if n == 1 else "cikli"
-        title = (
-            f"Livoltek {plan.target_date}: {n} {cycle_word}, "
-            f"tīrais €{plan.total_net_profit_eur:.2f}"
-        )
+        word = "cikls" if n == 1 else "cikli"
+        title = f"Livoltek {plan.target_date}: {n} {word}"
+        tags = ["battery"]
 
-    sections: list[str] = []
+    lines: list[str] = []
+    if pv_forecast is not None:
+        lines.append(f"PV: {pv_forecast.expected_kwh:.1f} kWh")
+        lines.append("")
 
-    context = _format_day_context(pv_forecast, hourly_prices, settings)
-    if context:
-        sections.append("\n".join(context))
+    if not has_stop and not has_cycles:
+        lines.append("ToU izslēgts")
+    else:
+        if has_stop:
+            sw = plan.stop_window
+            lines.append(f"{_fmt_local(sw.start)}-{_fmt_local(sw.end)} Stop")
+        for c in plan.cycles:
+            lines.append(
+                f"{_fmt_local(c.charge.start)}-{_fmt_local(c.charge.end)} Charge"
+            )
 
-    if plan.skipped_reason:
-        skip_block = [f"Plāns: izlaiž", f"Iemesls: {plan.skipped_reason}"]
-        explanation = _explain_skip(plan.skipped_reason)
-        if explanation:
-            skip_block.append("")
-            skip_block.append(explanation)
-        sections.append("\n".join(skip_block))
-        return title, "\n\n".join(sections), ["sunny"]
-
-    cycle_lines: list[str] = [f"Plāns: {len(plan.cycles)} cikls(i), tīrais €{plan.total_net_profit_eur:.2f}"]
-    for i, c in enumerate(plan.cycles, 1):
-        cycle_lines.append("")
-        cycle_lines.extend(_format_cycle_block(c, i, len(plan.cycles)))
-    sections.append("\n".join(cycle_lines))
-    return title, "\n\n".join(sections), ["battery"]
+    return title, "\n".join(lines), tags
 
 
 def format_error_message(context: str, exc: BaseException) -> tuple[str, str, int]:

@@ -127,56 +127,7 @@ async def test_send_raises_on_transport_error(settings):
         await NtfyClient(settings).send("hi")
 
 
-# --- format_plan_message -----------------------------------------------------
-
-
-def test_format_plan_message_skipped():
-    plan = DailyPlan(
-        target_date=date(2026, 5, 10),
-        cycles=[],
-        skipped_reason="PV forecast 30 kWh covers expected load 22 kWh",
-        total_net_profit_eur=0.0,
-    )
-    title, body, tags = format_plan_message(plan)
-    assert "2026-05-10" in title
-    assert "izlaiž" in title
-    assert "PV forecast" in body
-    assert "sunny" in tags
-
-
-def test_format_plan_message_single_cycle_uses_riga_local_times():
-    # UTC 11:00 -> Riga 14:00 (EEST in May)
-    plan = DailyPlan(
-        target_date=date(2026, 5, 9),
-        cycles=[_cycle(charge_h=11, disch_h=18, charge_price=0.006, disch_price=0.144, net=0.13)],
-        skipped_reason=None,
-        total_net_profit_eur=0.13,
-    )
-    title, body, tags = format_plan_message(plan)
-    assert "1 cikls" in title
-    assert "0.13" in title
-    assert "14:00" in body and "16:00" in body  # charge window
-    assert "21:00" in body and "23:00" in body  # discharge window
-    assert "battery" in tags
-
-
-def test_format_plan_message_two_cycles_labels_each():
-    plan = DailyPlan(
-        target_date=date(2026, 5, 9),
-        cycles=[
-            _cycle(charge_h=2, disch_h=8, charge_price=0.05, disch_price=0.30, net=0.20),
-            _cycle(charge_h=12, disch_h=18, charge_price=0.06, disch_price=0.28, net=0.15),
-        ],
-        skipped_reason=None,
-        total_net_profit_eur=0.35,
-    )
-    title, body, _ = format_plan_message(plan)
-    assert "2 cikli" in title
-    assert "Cikls 1" in body
-    assert "Cikls 2" in body
-
-
-# --- richer context-aware format -----------------------------------------
+# --- format_plan_message (minimal slot listing) ---------------------------
 
 
 def _pv_forecast(kwh: float, cloud_pct: float = 50.0) -> PvForecast:
@@ -189,71 +140,107 @@ def _pv_forecast(kwh: float, cloud_pct: float = 50.0) -> PvForecast:
     )
 
 
-def _hourly(prices: list[float]) -> list[HourlyPrice]:
-    base = datetime(2026, 5, 9, 0, 0, tzinfo=UTC)
-    return [
-        HourlyPrice(start=base.replace(hour=i), eur_per_kwh=p)
-        for i, p in enumerate(prices)
-    ]
-
-
-def test_format_plan_message_includes_day_context_when_supplied():
+def test_format_plan_message_empty_plan_says_tou_off():
     plan = DailyPlan(
-        target_date=date(2026, 5, 9),
-        cycles=[_cycle(charge_h=2, disch_h=18, charge_price=0.05, disch_price=0.30, net=0.62)],
-        skipped_reason=None,
-        total_net_profit_eur=0.62,
-    )
-    settings = Settings(expected_daily_load_kwh=22.0)
-    pv = _pv_forecast(8.0, cloud_pct=90)
-    hourly = _hourly([0.1, 0.05, 0.06, 0.06, 0.1, 0.1, 0.12, 0.15, 0.20, 0.25, 0.20, 0.18, 0.15, 0.12, 0.10, 0.10, 0.18, 0.25, 0.30, 0.28, 0.22, 0.18, 0.14, 0.12])
-    _, body, _ = format_plan_message(plan, pv_forecast=pv, hourly_prices=hourly, settings=settings)
-    assert "PV prognoze: 8.0 kWh" in body
-    assert "Paredzamais patēriņš: 22 kWh" in body
-    assert "Tīkla imports paredzami: 14.0 kWh" in body
-    assert "Cenu diapazons:" in body
-    assert "spread" in body
-    assert "lētākais brīdis" in body
-    assert "Mājsaimniecība izlādēs" in body
-
-
-def test_format_plan_message_skip_with_pv_cover_explanation():
-    plan = DailyPlan(
-        target_date=date(2026, 5, 9),
+        target_date=date(2026, 5, 10),
         cycles=[],
-        skipped_reason="PV forecast 30.0 kWh leaves only 0.0 kWh grid imports — below one cycle output (9.2 kWh)",
+        skipped_reason="PV forecast 30 kWh covers expected load 22 kWh",
         total_net_profit_eur=0.0,
     )
-    settings = Settings(expected_daily_load_kwh=22.0)
-    pv = _pv_forecast(30.0, cloud_pct=10)
-    _, body, tags = format_plan_message(plan, pv_forecast=pv, settings=settings)
-    assert "PV prognoze: 30.0 kWh" in body
-    assert "PV ražos vairāk" in body
+    title, body, tags = format_plan_message(plan, pv_forecast=_pv_forecast(30.0))
+    assert "2026-05-10" in title
+    assert "ToU izslēgts" in title
+    assert "ToU izslēgts" in body
+    assert "PV: 30.0 kWh" in body
     assert "sunny" in tags
 
 
-def test_format_plan_message_skip_with_low_spread_explanation():
+def test_format_plan_message_single_cycle_listed_with_riga_times():
+    # UTC 11:00 -> Riga 14:00 (EEST in May)
     plan = DailyPlan(
         target_date=date(2026, 5, 9),
-        cycles=[],
-        skipped_reason="no cycle nets at least 0.25 EUR",
-        total_net_profit_eur=0.0,
+        cycles=[_cycle(charge_h=11, disch_h=18, charge_price=0.006, disch_price=0.144, net=0.13)],
+        skipped_reason=None,
+        total_net_profit_eur=0.13,
     )
-    _, body, _ = format_plan_message(plan)
-    assert "spread ir pārāk līdzens" in body
+    title, body, tags = format_plan_message(plan, pv_forecast=_pv_forecast(8.0))
+    assert "1 cikls" in title
+    assert "PV: 8.0 kWh" in body
+    assert "14:00-16:00 Charge" in body
+    # We no longer show discharge times — only the charge slot is written
+    # to the portal; discharge is implicit via Self-use mode.
+    assert "21:00" not in body
+    assert "battery" in tags
 
 
-def test_format_plan_message_without_context_falls_back_to_compact():
-    # Existing callers that don't pass context still work.
+def test_format_plan_message_two_cycles_listed_in_order():
+    plan = DailyPlan(
+        target_date=date(2026, 5, 9),
+        cycles=[
+            _cycle(charge_h=2, disch_h=8, charge_price=0.05, disch_price=0.30, net=0.20),
+            _cycle(charge_h=12, disch_h=18, charge_price=0.06, disch_price=0.28, net=0.15),
+        ],
+        skipped_reason=None,
+        total_net_profit_eur=0.35,
+    )
+    title, body, _ = format_plan_message(plan, pv_forecast=_pv_forecast(8.0))
+    assert "2 cikli" in title
+    # Both charge windows listed, in UTC→Riga order
+    assert "05:00-07:00 Charge" in body
+    assert "15:00-17:00 Charge" in body
+
+
+def test_format_plan_message_stop_window_only():
+    window = TradingWindow(
+        start=datetime(2026, 5, 14, 3, 0, tzinfo=UTC),   # Riga 06:00
+        end=datetime(2026, 5, 14, 7, 0, tzinfo=UTC),     # Riga 10:00
+        avg_eur_per_kwh=0.08,
+    )
+    plan = DailyPlan(
+        target_date=date(2026, 5, 14),
+        cycles=[],
+        skipped_reason=None,
+        total_net_profit_eur=0.0,
+        stop_window=window,
+    )
+    title, body, tags = format_plan_message(plan, pv_forecast=_pv_forecast(71.0))
+    assert "Stop" in title
+    assert "cikls" not in title and "cikli" not in title
+    assert "06:00-10:00 Stop" in body
+    assert "PV: 71.0 kWh" in body
+    assert "sunny" in tags
+
+
+def test_format_plan_message_stop_plus_cycle():
+    window = TradingWindow(
+        start=datetime(2026, 5, 14, 3, 0, tzinfo=UTC),   # Riga 06:00
+        end=datetime(2026, 5, 14, 7, 0, tzinfo=UTC),     # Riga 10:00
+        avg_eur_per_kwh=0.08,
+    )
+    plan = DailyPlan(
+        target_date=date(2026, 5, 14),
+        cycles=[_cycle(charge_h=11, disch_h=18, charge_price=0.01, disch_price=0.14, net=0.50)],
+        skipped_reason=None,
+        total_net_profit_eur=0.50,
+        stop_window=window,
+    )
+    title, body, tags = format_plan_message(plan, pv_forecast=_pv_forecast(25.0))
+    assert "Stop + 1 cikls" in title
+    # Stop slot first, then the Charge slot
+    assert body.index("06:00-10:00 Stop") < body.index("14:00-16:00 Charge")
+    assert "battery" in tags
+
+
+def test_format_plan_message_omits_pv_line_when_forecast_not_supplied():
     plan = DailyPlan(
         target_date=date(2026, 5, 9),
         cycles=[_cycle(charge_h=2, disch_h=18, charge_price=0.05, disch_price=0.30, net=0.62)],
         skipped_reason=None,
         total_net_profit_eur=0.62,
     )
-    title, body, _ = format_plan_message(plan)
-    assert "1 cikls" in title
-    assert "PV prognoze" not in body  # no context section
+    _, body, _ = format_plan_message(plan)
+    assert "PV:" not in body
+    assert "05:00-07:00 Charge" in body
 
 
 # --- format_error_message ----------------------------------------------------

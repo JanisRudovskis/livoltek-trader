@@ -28,7 +28,7 @@ from playwright.async_api import (
 )
 
 from livoltek_trader.config import Settings, get_settings
-from livoltek_trader.strategy import CyclePair, DailyPlan
+from livoltek_trader.strategy import CyclePair, DailyPlan, TradingWindow
 
 RIGA_TZ = ZoneInfo("Europe/Riga")
 
@@ -278,18 +278,20 @@ class LivoltekClient:
         """Write the day's plan to the System mode form.
 
         Behaviour:
-        - If `plan.cycles` is empty, disable Enable ToU schedule (inverter
-          falls back to pure Self-use mode — no scheduled grid charging).
-        - Otherwise, enable ToU and fill slots 1..N with Charge rows for
-          today's weekday only. Slots N+1..6 are set to `Without a strategy`
-          so any old configuration is overwritten.
+        - If `plan.is_empty` (no cycles AND no Stop window), disable
+          Enable ToU schedule — inverter falls back to pure Self-use mode.
+        - Otherwise, enable ToU and fill slots in this order:
+            slot 0: Stop window (if present)
+            next:   Charge cycles (in time order)
+            last:   `Without a strategy` for unused slots
+          All slots fire on today's weekday only.
 
         With `save=False` (default), the form is filled but `Save Params.`
         is NOT clicked — values stay local to the browser session and are
         lost on page reload. Use `save=True` to commit to the inverter.
         """
         page = self.page
-        if not plan.cycles:
+        if plan.is_empty:
             await self._set_tou_enabled(False)
             log.info("livoltek.apply_schedule.skip_day", reason=plan.skipped_reason)
         else:
@@ -297,16 +299,27 @@ class LivoltekClient:
             today_weekday = _WEEKDAY_LABELS[
                 datetime.now(RIGA_TZ).weekday()
             ]
-            for slot_idx in range(6):
-                if slot_idx < len(plan.cycles):
-                    await self._fill_charge_slot(
-                        slot_idx, plan.cycles[slot_idx], today_weekday
-                    )
-                else:
-                    await self._clear_slot(slot_idx)
+
+            slot_idx = 0
+            if plan.stop_window is not None:
+                await self._fill_stop_slot(
+                    slot_idx, plan.stop_window, today_weekday
+                )
+                slot_idx += 1
+
+            for cycle in plan.cycles:
+                if slot_idx >= 6:
+                    break
+                await self._fill_charge_slot(slot_idx, cycle, today_weekday)
+                slot_idx += 1
+
+            for clear_idx in range(slot_idx, 6):
+                await self._clear_slot(clear_idx)
+
             log.info(
                 "livoltek.apply_schedule.filled",
                 cycles=len(plan.cycles),
+                stop_window=plan.stop_window is not None,
                 weekday=today_weekday,
             )
 
@@ -361,6 +374,33 @@ class LivoltekClient:
         await self._fill_number_field("SOC", slot_idx, "100")
         log.info(
             "livoltek.slot.filled",
+            slot=slot_idx,
+            start=start_str,
+            end=end_str,
+            weekday=weekday,
+        )
+
+    async def _fill_stop_slot(
+        self, slot_idx: int, window: TradingWindow, weekday: str
+    ) -> None:
+        """Fill one schedule row as a Stop slot (battery freeze, PV → grid).
+
+        Stop slot semantics on the inverter: during the window the battery
+        will neither charge nor discharge; PV continues to flow to load
+        first, then excess exports to grid. Power/SOC fields appear unused
+        for Stop but we set them defensively to match the Charge defaults.
+        """
+        start_str = window.start.astimezone(RIGA_TZ).strftime("%H:%M")
+        end_str = window.end.astimezone(RIGA_TZ).strftime("%H:%M")
+
+        await self._fill_time_field("Start Time", slot_idx, start_str)
+        await self._fill_time_field("End Time", slot_idx, end_str)
+        await self._select_strategy(slot_idx, "Stop")
+        await self._set_slot_weekday(slot_idx, weekday)
+        await self._fill_number_field("Power", slot_idx, "10.00")
+        await self._fill_number_field("SOC", slot_idx, "100")
+        log.info(
+            "livoltek.slot.stop_filled",
             slot=slot_idx,
             start=start_str,
             end=end_str,

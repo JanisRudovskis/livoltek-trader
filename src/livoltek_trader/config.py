@@ -22,6 +22,22 @@ class Settings(BaseSettings):
     max_cycles_per_day: int = Field(default=6, ge=0, le=6)
     hours_per_cycle: int = Field(default=2, ge=1)
     min_net_profit_per_cycle_eur: float = Field(default=0.25)
+    stop_sell_threshold_eur_per_kwh: float = Field(default=0.02, ge=0.0)
+    """Minimum spot price for a Stop slot to be worth adding.
+
+    When PV is producing and the spot price exceeds this threshold, we'd
+    rather let PV export to grid (revenue = spot − supplier margin) than
+    let it charge the battery. Below this threshold the export revenue is
+    too low to bother — natural Self-use (PV → battery → evening) wins.
+    """
+    stop_pv_window_start_hour_riga: int = Field(default=6, ge=0, le=23)
+    stop_pv_window_end_hour_riga: int = Field(default=20, ge=1, le=24)
+    """Riga-local clock hours bracketing the PV-producing window.
+
+    Stop slots are only considered for hours inside this window. Default
+    06:00–20:00 covers Latvian sunrise/sunset across all seasons (summer
+    is wider, winter narrower — we use the union).
+    """
 
     open_meteo_base_url: str = Field(default="https://api.open-meteo.com/v1")
     pv_lat: float = Field(default=56.918)
