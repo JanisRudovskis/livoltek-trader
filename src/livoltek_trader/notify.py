@@ -110,12 +110,12 @@ def format_plan_message(
         title = f"Livoltek {plan.target_date}: ToU izslēgts"
         tags = ["sunny"]
     elif has_stop and not has_cycles:
-        title = f"Livoltek {plan.target_date}: Stop"
+        title = f"Livoltek {plan.target_date}: Discharge"
         tags = ["sunny"]
     elif has_stop and has_cycles:
         n = len(plan.cycles)
         word = "cikls" if n == 1 else "cikli"
-        title = f"Livoltek {plan.target_date}: Stop + {n} {word}"
+        title = f"Livoltek {plan.target_date}: Discharge + {n} {word}"
         tags = ["battery"]
     else:
         n = len(plan.cycles)
@@ -133,7 +133,9 @@ def format_plan_message(
     else:
         if has_stop:
             sw = plan.stop_window
-            lines.append(f"{_fmt_local(sw.start)}-{_fmt_local(sw.end)} Stop")
+            lines.append(
+                f"{_fmt_local(sw.start)}-{_fmt_local(sw.end)} Discharge"
+            )
         for c in plan.cycles:
             lines.append(
                 f"{_fmt_local(c.charge.start)}-{_fmt_local(c.charge.end)} Charge"

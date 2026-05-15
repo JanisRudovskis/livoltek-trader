@@ -384,28 +384,39 @@ class LivoltekClient:
     async def _fill_stop_slot(
         self, slot_idx: int, window: TradingWindow, weekday: str
     ) -> None:
-        """Fill one schedule row as a Stop slot (battery freeze, PV → grid).
+        """Fill one schedule row as a morning Discharge slot (drain + export).
 
-        Stop slot semantics on the inverter: during the window the battery
-        will neither charge nor discharge; PV continues to flow to load
-        first, then excess exports to grid. Power/SOC fields appear unused
-        for Stop but we set them defensively to match the Charge defaults.
+        Strategy is `Discharge` with SOC target from settings (default 15%):
+        - During the window the battery actively discharges to the grid at
+          the high morning spot price until SOC reaches the target.
+        - PV continues to flow (Self-use priority during Discharge — load
+          first, excess to grid) so we also pocket export revenue on PV.
+        - After the window ends, normal Self-use resumes and the battery
+          refills from afternoon PV for evening discharge to load.
+
+        We keep the helper name `_fill_stop_slot` for backwards-compatibility
+        with the planner's `stop_window` field — conceptually this is still
+        the "block-and-export" morning window; the implementation just
+        improves on the Stop-strategy version by also selling any leftover
+        SOC from yesterday at the peak morning price.
         """
         start_str = window.start.astimezone(RIGA_TZ).strftime("%H:%M")
         end_str = window.end.astimezone(RIGA_TZ).strftime("%H:%M")
+        soc_target = str(self._settings.morning_discharge_target_soc_pct)
 
         await self._fill_time_field("Start Time", slot_idx, start_str)
         await self._fill_time_field("End Time", slot_idx, end_str)
-        await self._select_strategy(slot_idx, "Stop")
+        await self._select_strategy(slot_idx, "Discharge")
         await self._set_slot_weekday(slot_idx, weekday)
         await self._fill_number_field("Power", slot_idx, "10.00")
-        await self._fill_number_field("SOC", slot_idx, "100")
+        await self._fill_number_field("SOC", slot_idx, soc_target)
         log.info(
-            "livoltek.slot.stop_filled",
+            "livoltek.slot.morning_discharge_filled",
             slot=slot_idx,
             start=start_str,
             end=end_str,
             weekday=weekday,
+            soc_target=soc_target,
         )
 
     async def _clear_slot(self, slot_idx: int) -> None:

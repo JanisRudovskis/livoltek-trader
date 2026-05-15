@@ -204,9 +204,9 @@ def test_format_plan_message_stop_window_only():
         stop_window=window,
     )
     title, body, tags = format_plan_message(plan, pv_forecast=_pv_forecast(71.0))
-    assert "Stop" in title
+    assert "Discharge" in title
     assert "cikls" not in title and "cikli" not in title
-    assert "06:00-10:00 Stop" in body
+    assert "06:00-10:00 Discharge" in body
     assert "PV: 71.0 kWh" in body
     assert "sunny" in tags
 
@@ -225,9 +225,9 @@ def test_format_plan_message_stop_plus_cycle():
         stop_window=window,
     )
     title, body, tags = format_plan_message(plan, pv_forecast=_pv_forecast(25.0))
-    assert "Stop + 1 cikls" in title
-    # Stop slot first, then the Charge slot
-    assert body.index("06:00-10:00 Stop") < body.index("14:00-16:00 Charge")
+    assert "Discharge + 1 cikls" in title
+    # Morning Discharge slot first, then the Charge slot
+    assert body.index("06:00-10:00 Discharge") < body.index("14:00-16:00 Charge")
     assert "battery" in tags
 
 

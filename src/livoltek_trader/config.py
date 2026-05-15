@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     06:00–20:00 covers Latvian sunrise/sunset across all seasons (summer
     is wider, winter narrower — we use the union).
     """
+    morning_discharge_target_soc_pct: int = Field(default=15, ge=10, le=100)
+    """SOC target written to the Livoltek Discharge slot used as the
+    morning block-and-export window.
+
+    The inverter drains battery to grid until this SOC, then holds. With
+    BMS minimum at 10%, 15% leaves a 5% safety margin for any UPS-mode
+    headroom we want to preserve. After the window ends, PV refills the
+    battery during the day for evening Self-use discharge.
+    """
 
     open_meteo_base_url: str = Field(default="https://api.open-meteo.com/v1")
     pv_lat: float = Field(default=56.918)
