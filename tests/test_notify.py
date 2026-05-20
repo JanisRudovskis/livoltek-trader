@@ -166,7 +166,7 @@ def test_format_plan_message_single_cycle_listed_with_riga_times():
     title, body, tags = format_plan_message(plan, pv_forecast=_pv_forecast(8.0))
     assert "1 cikls" in title
     assert "PV: 8.0 kWh" in body
-    assert "14:00-16:00 Charge" in body
+    assert "14:00-16:00 Charge 100%" in body
     # We no longer show discharge times — only the charge slot is written
     # to the portal; discharge is implicit via Self-use mode.
     assert "21:00" not in body
@@ -186,8 +186,8 @@ def test_format_plan_message_two_cycles_listed_in_order():
     title, body, _ = format_plan_message(plan, pv_forecast=_pv_forecast(8.0))
     assert "2 cikli" in title
     # Both charge windows listed, in UTC→Riga order
-    assert "05:00-07:00 Charge" in body
-    assert "15:00-17:00 Charge" in body
+    assert "05:00-07:00 Charge 100%" in body
+    assert "15:00-17:00 Charge 100%" in body
 
 
 def test_format_plan_message_stop_window_only():
@@ -204,9 +204,9 @@ def test_format_plan_message_stop_window_only():
         stop_window=window,
     )
     title, body, tags = format_plan_message(plan, pv_forecast=_pv_forecast(71.0))
-    assert "Discharge" in title
+    assert "Charge 15%" in title
     assert "cikls" not in title and "cikli" not in title
-    assert "06:00-10:00 Discharge" in body
+    assert "06:00-10:00 Charge 15%" in body
     assert "PV: 71.0 kWh" in body
     assert "sunny" in tags
 
@@ -225,9 +225,9 @@ def test_format_plan_message_stop_plus_cycle():
         stop_window=window,
     )
     title, body, tags = format_plan_message(plan, pv_forecast=_pv_forecast(25.0))
-    assert "Discharge + 1 cikls" in title
-    # Morning Discharge slot first, then the Charge slot
-    assert body.index("06:00-10:00 Discharge") < body.index("14:00-16:00 Charge")
+    assert "Charge 15% + 1 cikls" in title
+    # Morning Charge-15 slot first, then the cycle Charge-100 slot
+    assert body.index("06:00-10:00 Charge 15%") < body.index("14:00-16:00 Charge 100%")
     assert "battery" in tags
 
 
@@ -240,7 +240,7 @@ def test_format_plan_message_omits_pv_line_when_forecast_not_supplied():
     )
     _, body, _ = format_plan_message(plan)
     assert "PV:" not in body
-    assert "05:00-07:00 Charge" in body
+    assert "05:00-07:00 Charge 100%" in body
 
 
 # --- format_error_message ----------------------------------------------------

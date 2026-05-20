@@ -384,21 +384,24 @@ class LivoltekClient:
     async def _fill_stop_slot(
         self, slot_idx: int, window: TradingWindow, weekday: str
     ) -> None:
-        """Fill one schedule row as a morning Discharge slot (drain + export).
+        """Fill one schedule row as a morning Charge-with-low-SOC slot.
 
-        Strategy is `Discharge` with SOC target from settings (default 15%):
-        - During the window the battery actively discharges to the grid at
-          the high morning spot price until SOC reaches the target.
-        - PV continues to flow (Self-use priority during Discharge — load
-          first, excess to grid) so we also pocket export revenue on PV.
-        - After the window ends, normal Self-use resumes and the battery
-          refills from afternoon PV for evening discharge to load.
+        Strategy is `Charge` with SOC target from settings (default 15%).
+        Intent: cap the battery at 15% during the morning so excess PV is
+        forced to grid at the high morning spot price. Behaviour depends
+        on what the inverter does when current SOC > target SOC:
 
-        We keep the helper name `_fill_stop_slot` for backwards-compatibility
-        with the planner's `stop_window` field — conceptually this is still
-        the "block-and-export" morning window; the implementation just
-        improves on the Stop-strategy version by also selling any leftover
-        SOC from yesterday at the peak morning price.
+        - Optimistic (battery holds at 15%, rest of PV exports): exactly
+          what we want. This matches the user's expectation when they
+          asked for "charge only 15% of battery, rest sold."
+        - Pessimistic (battery drains to 15% to match target): same risk
+          profile as the previous Discharge slot — fine on sunny days,
+          bad on cloudy days where PV doesn't refill before evening.
+
+        We keep the helper name `_fill_stop_slot` for compatibility with
+        the planner's `stop_window` field — conceptually it's still the
+        "block-and-export morning window", just implemented with a
+        different strategy string and a low SOC ceiling.
         """
         start_str = window.start.astimezone(RIGA_TZ).strftime("%H:%M")
         end_str = window.end.astimezone(RIGA_TZ).strftime("%H:%M")
@@ -406,12 +409,12 @@ class LivoltekClient:
 
         await self._fill_time_field("Start Time", slot_idx, start_str)
         await self._fill_time_field("End Time", slot_idx, end_str)
-        await self._select_strategy(slot_idx, "Discharge")
+        await self._select_strategy(slot_idx, "Charge")
         await self._set_slot_weekday(slot_idx, weekday)
         await self._fill_number_field("Power", slot_idx, "10.00")
         await self._fill_number_field("SOC", slot_idx, soc_target)
         log.info(
-            "livoltek.slot.morning_discharge_filled",
+            "livoltek.slot.morning_charge_low_soc_filled",
             slot=slot_idx,
             start=start_str,
             end=end_str,

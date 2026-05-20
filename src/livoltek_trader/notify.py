@@ -106,16 +106,24 @@ def format_plan_message(
     has_stop = plan.stop_window is not None
     has_cycles = bool(plan.cycles)
 
+    # Morning slot SOC ceiling (displayed alongside the strategy label so
+    # users can distinguish it from the normal full-charge cycle slots).
+    morning_soc = (
+        settings.morning_discharge_target_soc_pct if settings is not None else 15
+    )
+
     if not has_stop and not has_cycles:
         title = f"Livoltek {plan.target_date}: ToU izslēgts"
         tags = ["sunny"]
     elif has_stop and not has_cycles:
-        title = f"Livoltek {plan.target_date}: Discharge"
+        title = f"Livoltek {plan.target_date}: Charge {morning_soc}%"
         tags = ["sunny"]
     elif has_stop and has_cycles:
         n = len(plan.cycles)
         word = "cikls" if n == 1 else "cikli"
-        title = f"Livoltek {plan.target_date}: Discharge + {n} {word}"
+        title = (
+            f"Livoltek {plan.target_date}: Charge {morning_soc}% + {n} {word}"
+        )
         tags = ["battery"]
     else:
         n = len(plan.cycles)
@@ -134,11 +142,11 @@ def format_plan_message(
         if has_stop:
             sw = plan.stop_window
             lines.append(
-                f"{_fmt_local(sw.start)}-{_fmt_local(sw.end)} Discharge"
+                f"{_fmt_local(sw.start)}-{_fmt_local(sw.end)} Charge {morning_soc}%"
             )
         for c in plan.cycles:
             lines.append(
-                f"{_fmt_local(c.charge.start)}-{_fmt_local(c.charge.end)} Charge"
+                f"{_fmt_local(c.charge.start)}-{_fmt_local(c.charge.end)} Charge 100%"
             )
 
     return title, "\n".join(lines), tags
