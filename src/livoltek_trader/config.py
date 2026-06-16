@@ -48,6 +48,23 @@ class Settings(BaseSettings):
     the BMS cutoff. After the window ends, PV refills the battery during
     the day for evening Self-use discharge.
     """
+    sunny_day_pv_load_multiplier: float = Field(default=1.5, ge=1.0)
+    """Margin above load required to commit to the morning Discharge slot.
+
+    Discharge slot is planned only when expected PV ≥ load × this. A margin
+    above 1.0 protects against forecast error on borderline cloudy days
+    (e.g. cloud_cover_pct=90 still gives high diffuse radiation in May, but
+    actual production can drop 30%+ vs forecast). Default 1.5 → PV must
+    cover load with 50% headroom before we drain the battery.
+    """
+    morning_peak_end_multiplier: float = Field(default=2.0, ge=1.0)
+    """Threshold for truncating the morning Discharge window.
+
+    Window covers the FIRST contiguous run of daylight hours whose spot
+    is above `cheapest_daylight_price × this`. Default 2.0 → if the
+    cheapest daylight hour is €0.05, the window stops as soon as prices
+    drop to €0.10. Avoids selling at near-cheap rates and overstaying.
+    """
 
     open_meteo_base_url: str = Field(default="https://api.open-meteo.com/v1")
     pv_lat: float = Field(default=56.918)

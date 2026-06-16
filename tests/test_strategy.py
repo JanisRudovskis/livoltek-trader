@@ -384,29 +384,46 @@ def _stop_scenario_hourly(day: int) -> list[HourlyPrice]:
     return _hourly_series(day, prices)
 
 
-def test_plan_day_adds_stop_window_on_pv_abundant_day(settings):
-    # PV (30) > load (22). Cycle output 5 kWh > grid imports 0 — cycles skipped.
-    # Stop should still cover the morning peak through midday cheap.
+def test_plan_day_adds_stop_window_on_sunny_day(settings):
+    # PV (35) ≥ load (22) × 1.5. Cycle output 5 kWh > grid imports 0 — cycles
+    # skipped. Discharge window should cover the morning peak.
     settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
     hourly = _stop_scenario_hourly(9)
     plan = plan_day(
         hourly,
         date(2026, 5, 9),
         settings,
-        pv_forecast=_pv(date(2026, 5, 9), kwh=30.0),
+        pv_forecast=_pv(date(2026, 5, 9), kwh=35.0),
     )
     assert plan.cycles == []
     assert plan.stop_window is not None
-    # Stop should end at the cheapest hour (UTC 9) and start at the first
-    # qualifying hour in the PV daylight window.
+    # Window ends just before the cheapest hour (UTC 9 = Riga 12).
     assert plan.stop_window.end == _hour(9, 9)
     assert plan.stop_window.avg_eur_per_kwh > 0.02
     assert plan.skipped_reason is None
     assert not plan.is_empty
 
 
-def test_plan_day_stop_window_skipped_when_pv_not_abundant(settings):
-    # PV (15) < load (22) — Stop logic must NOT trigger.
+def test_plan_day_no_stop_window_when_pv_below_multiplier(settings):
+    # PV (27) > load (22), but PV/load = 1.23 < 1.5 multiplier.
+    # Borderline cloudy day: forecast might be wrong, so skip Discharge.
+    # This is today's scenario (2026-05-21).
+    settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
+    hourly = _stop_scenario_hourly(9)
+    plan = plan_day(
+        hourly,
+        date(2026, 5, 9),
+        settings,
+        pv_forecast=_pv(date(2026, 5, 9), kwh=27.0),
+    )
+    assert plan.stop_window is None
+    # Cycles also skipped via existing gap-vs-cycle-output check.
+    assert plan.cycles == []
+    assert plan.is_empty
+
+
+def test_plan_day_stop_window_skipped_when_pv_low(settings):
+    # PV (15) < load (22) — Discharge must NOT trigger on cloudy days.
     settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
     hourly = _stop_scenario_hourly(9)
     plan = plan_day(
@@ -418,8 +435,36 @@ def test_plan_day_stop_window_skipped_when_pv_not_abundant(settings):
     assert plan.stop_window is None
 
 
+def test_plan_day_stop_window_truncates_at_peak_end_threshold(settings):
+    # Morning peak ends where price drops below cheapest × peak_end_multiplier.
+    # cheapest = 0.05; peak_end_threshold = 0.05 × 2 = 0.10.
+    # Hours above 0.10 form the run; first hour at or below ends it.
+    settings = settings.model_copy(
+        update={
+            "expected_daily_load_kwh": 22.0,
+            "morning_peak_end_multiplier": 2.0,
+        }
+    )
+    prices = [0.05] * 24
+    # PV daylight window UTC 3..16. Morning peak UTC 3-5 (Riga 6-8),
+    # then a transitional cheap stretch, then cheapest at UTC 10.
+    prices[3:6] = [0.20, 0.20, 0.20]  # well above 0.10 → in run
+    prices[6:10] = [0.08, 0.08, 0.08, 0.08]  # below 0.10 → ends the run
+    prices[10] = 0.05  # cheapest midday
+    hourly = _hourly_series(9, prices)
+    plan = plan_day(
+        hourly,
+        date(2026, 5, 9),
+        settings,
+        pv_forecast=_pv(date(2026, 5, 9), kwh=35.0),
+    )
+    assert plan.stop_window is not None
+    assert plan.stop_window.start == _hour(9, 3)
+    assert plan.stop_window.end == _hour(9, 6)  # stops where price falls to 0.08
+
+
 def test_plan_day_stop_window_skipped_when_prices_flat(settings):
-    # Flat prices: no peak before the cheapest hour. Stop window must be None.
+    # Flat prices: no peak before the cheapest hour. Discharge must be None.
     settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
     prices = [0.10] * 24
     hourly = _hourly_series(9, prices)
@@ -427,35 +472,35 @@ def test_plan_day_stop_window_skipped_when_prices_flat(settings):
         hourly,
         date(2026, 5, 9),
         settings,
-        pv_forecast=_pv(date(2026, 5, 9), kwh=30.0),
+        pv_forecast=_pv(date(2026, 5, 9), kwh=35.0),
     )
     assert plan.stop_window is None
 
 
 def test_plan_day_stop_window_respects_sell_threshold(settings):
-    # Morning peak hours that are BELOW the sell threshold disqualify and
-    # break the contiguous Stop block — only hours immediately preceding
-    # the cheapest with spot > threshold count.
+    # An hour below sell_threshold breaks the morning peak run even if it's
+    # nominally part of "morning". Window ends at the first below-threshold hour.
     settings = settings.model_copy(
         update={
             "expected_daily_load_kwh": 22.0,
             "stop_sell_threshold_eur_per_kwh": 0.05,
+            "morning_peak_end_multiplier": 2.0,
         }
     )
     prices = [0.10] * 24
-    prices[4:7] = [0.04, 0.04, 0.04]  # below threshold; breaks the block
+    prices[3:6] = [0.20, 0.20, 0.20]  # qualifying morning peak (UTC 3-5)
+    prices[6] = 0.04  # below sell_threshold → breaks the run
     prices[10] = 0.01  # cheapest midday
     hourly = _hourly_series(9, prices)
     plan = plan_day(
         hourly,
         date(2026, 5, 9),
         settings,
-        pv_forecast=_pv(date(2026, 5, 9), kwh=30.0),
+        pv_forecast=_pv(date(2026, 5, 9), kwh=35.0),
     )
     assert plan.stop_window is not None
-    # Only UTC 7-9 qualify (above 0.05); UTC 4-6 break the back-walk.
-    assert plan.stop_window.start == _hour(9, 7)
-    assert plan.stop_window.end == _hour(9, 10)
+    assert plan.stop_window.start == _hour(9, 3)
+    assert plan.stop_window.end == _hour(9, 6)
 
 
 def test_plan_day_stop_window_skipped_when_cheapest_is_first_daylight_hour(settings):
@@ -469,15 +514,14 @@ def test_plan_day_stop_window_skipped_when_cheapest_is_first_daylight_hour(setti
         hourly,
         date(2026, 5, 9),
         settings,
-        pv_forecast=_pv(date(2026, 5, 9), kwh=30.0),
+        pv_forecast=_pv(date(2026, 5, 9), kwh=35.0),
     )
     assert plan.stop_window is None
 
 
-def test_plan_day_stop_window_and_cycle_coexist_on_mixed_day(settings):
-    # PV (25) > load (22), but grid imports gap (>cycle output 5 — no, equal,
-    # so cycles WILL be considered). Build a day with morning peak AND a
-    # profitable cheap→peak cycle late.
+def test_plan_day_stop_window_and_no_cycle_on_sunny_day(settings):
+    # PV (35) ≥ load (22) × 1.5 → Discharge planned. Cycles skipped because
+    # grid imports gap = 0 < cycle output 5. Discharge-only result.
     settings = settings.model_copy(
         update={
             "expected_daily_load_kwh": 22.0,
@@ -486,26 +530,19 @@ def test_plan_day_stop_window_and_cycle_coexist_on_mixed_day(settings):
             "max_cycles_per_day": 6,
         }
     )
-    # PV abundant (PV 25 > load 22) AND grid imports gap = 0 < cycle output 5,
-    # so cycles are SKIPPED. Only Stop applies.
-    # To get cycles AND Stop, we need PV abundant but enough load for cycles:
-    # Use load=10 instead. Then PV 25 > 10, gap = 0 < cycle 5 still skips.
-    # ⇒ in current model, cycles and Stop are mutually exclusive on the
-    # "abundant" half of the PV curve. Verify Stop-only behaviour here.
     hourly = _stop_scenario_hourly(9)
     plan = plan_day(
         hourly,
         date(2026, 5, 9),
         settings,
-        pv_forecast=_pv(date(2026, 5, 9), kwh=25.0),
+        pv_forecast=_pv(date(2026, 5, 9), kwh=35.0),
     )
     assert plan.stop_window is not None
-    # Cycles skipped because PV covers load; that's the architectural choice.
     assert plan.cycles == []
 
 
 def test_plan_day_returns_empty_plan_on_flat_low_pv_day(settings):
-    # PV low + flat prices: no cycles, no Stop, empty plan with skipped_reason.
+    # PV low + flat prices: no cycles, no Discharge, empty plan with skipped_reason.
     settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
     prices = [0.10] * 24
     hourly = _hourly_series(9, prices)

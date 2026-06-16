@@ -57,12 +57,13 @@ class CyclePair(BaseModel):
 class DailyPlan(BaseModel):
     """The chosen plan for a target day, possibly empty if not worthwhile.
 
-    `stop_window` is an optional morning window where we explicitly block the
-    battery from charging so the PV production is exported to grid at high
-    spot prices instead. Active only on PV-abundant days where the morning
-    spot is meaningfully higher than the cheap midday refill window. The
-    battery refills naturally from later PV (or via the planned Charge
-    cycles) and serves load via Self-use in the evening.
+    `stop_window` is an optional morning Discharge window: the battery is
+    drained to grid down to `morning_discharge_target_soc_pct` during the
+    morning peak, capturing the spot premium. Active only on sunny days
+    where expected PV ≥ load × `sunny_day_pv_load_multiplier` — below that
+    margin, we don't risk draining a battery we can't reliably refill from
+    PV. The battery refills from afternoon PV via Self-use and serves load
+    via Self-use in the evening peak.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -144,20 +145,19 @@ def _plan_stop_window(
     settings: Settings,
     used_hours: set[datetime],
 ) -> TradingWindow | None:
-    """Pick a continuous morning Stop window for PV-abundant days.
+    """Pick the morning Discharge window for sunny days.
 
     Rule: within the PV-producing daylight window, find the cheapest hour.
-    Consider only hours BEFORE that cheap hour as Stop candidates. A
-    candidate qualifies when spot is BOTH above the sell threshold AND
-    above the cheapest hour's spot. Return the LONGEST contiguous run of
-    qualifying candidates — below-threshold hours break the run and reset
-    the counter, so a real morning peak can be picked even if a few weird
-    near-zero quarter-hours sit between it and midday.
+    Compute a peak-end threshold = `cheapest_price × morning_peak_end_multiplier`.
+    Walk forward from the first daylight hour and collect the FIRST contiguous
+    run of hours whose spot is above this threshold. Stop at the first hour
+    that falls back below — we don't want to keep selling once prices are
+    only slightly above cheapest.
 
     Returns None if:
     - daylight window has fewer than 2 hours of price data
     - cheapest daylight hour is at the start of the window (no morning peak)
-    - no qualifying hours exist before the cheap hour
+    - no hour above the peak-end threshold exists before the cheap hour
     """
     if len(hourly) < 2:
         return None
@@ -178,36 +178,35 @@ def _plan_stop_window(
     cheapest_price = pv_hours[cheapest_idx].eur_per_kwh
 
     if cheapest_idx == 0:
-        return None  # cheap hour is already first daylight hour — no morning peak
+        return None  # cheap hour is first daylight hour — no morning peak
 
+    peak_end_threshold = cheapest_price * settings.morning_peak_end_multiplier
     sell_threshold = settings.stop_sell_threshold_eur_per_kwh
 
-    # Walk FORWARD through hours before the cheapest. Collect contiguous
-    # qualifying runs; on disqualification, reset the current run. Keep
-    # the longest run we've seen.
-    best_run: list[HourlyPrice] = []
-    current_run: list[HourlyPrice] = []
+    # Walk forward, collect the FIRST contiguous run above peak_end_threshold.
+    # Once we leave the run (hour drops below threshold), stop — we won't pick
+    # later peaks. A morning peak is what we want; trailing near-cheap hours
+    # would only erode the avg sell price.
+    run: list[HourlyPrice] = []
     for i in range(cheapest_idx):
         h = pv_hours[i]
         qualifies = (
-            h.eur_per_kwh > sell_threshold
-            and h.eur_per_kwh > cheapest_price
+            h.eur_per_kwh > peak_end_threshold
+            and h.eur_per_kwh > sell_threshold
             and h.start not in used_hours
         )
         if qualifies:
-            current_run.append(h)
-            if len(current_run) > len(best_run):
-                best_run = list(current_run)
-        else:
-            current_run = []
+            run.append(h)
+        elif run:
+            break  # peak ended — stop the run
 
-    if not best_run:
+    if not run:
         return None
 
-    avg = sum(h.eur_per_kwh for h in best_run) / len(best_run)
+    avg = sum(h.eur_per_kwh for h in run) / len(run)
     return TradingWindow(
-        start=best_run[0].start,
-        end=best_run[-1].start + timedelta(hours=1),
+        start=run[0].start,
+        end=run[-1].start + timedelta(hours=1),
         avg_eur_per_kwh=avg,
     )
 
@@ -297,16 +296,17 @@ def plan_day(
                     )
                 )
 
-                # Cap chosen cycles at 5 if we might add a Stop slot, so the
-                # 6-slot portal budget always has room. Cheap to do — drops
-                # at most one marginal cycle on PV-abundant days.
-                pv_abundant = (
+                # Cap chosen cycles at 5 if a sunny-day Discharge slot might be
+                # added, so the 6-slot portal budget always has room. Cheap to
+                # do — drops at most one marginal cycle on sunny days.
+                pv_sunny = (
                     pv_forecast is not None
                     and pv_forecast.expected_kwh
                     >= settings.expected_daily_load_kwh
+                    * settings.sunny_day_pv_load_multiplier
                 )
                 cycle_cap = settings.max_cycles_per_day
-                if pv_abundant:
+                if pv_sunny:
                     cycle_cap = min(cycle_cap, 5)
 
                 for cycle in candidates:
@@ -319,11 +319,15 @@ def plan_day(
 
                 chosen.sort(key=lambda c: c.charge.start)
 
-    # Stop-window planning: only on PV-abundant days.
+    # Morning Discharge window: only on sunny days where PV clearly exceeds
+    # load by the configured safety margin. Below this gate we trust Self-use
+    # to manage the battery without explicitly draining it in the morning.
     stop_window: TradingWindow | None = None
     if (
         pv_forecast is not None
-        and pv_forecast.expected_kwh >= settings.expected_daily_load_kwh
+        and pv_forecast.expected_kwh
+        >= settings.expected_daily_load_kwh
+        * settings.sunny_day_pv_load_multiplier
     ):
         stop_window = _plan_stop_window(hourly, settings, used_hours)
 

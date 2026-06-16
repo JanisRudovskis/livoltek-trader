@@ -384,24 +384,17 @@ class LivoltekClient:
     async def _fill_stop_slot(
         self, slot_idx: int, window: TradingWindow, weekday: str
     ) -> None:
-        """Fill one schedule row as a morning Charge-with-low-SOC slot.
+        """Fill one schedule row as a morning Discharge-to-grid slot.
 
-        Strategy is `Charge` with SOC target from settings (default 15%).
-        Intent: cap the battery at 15% during the morning so excess PV is
-        forced to grid at the high morning spot price. Behaviour depends
-        on what the inverter does when current SOC > target SOC:
+        Strategy is `Discharge` with SOC target from settings (default 15%).
+        The inverter drains the battery to grid until SOC reaches the target,
+        capturing the morning spot premium. Sunny-day gate (PV ≥ load × 1.5)
+        ensures afternoon PV will refill the battery before evening peak —
+        on cloudier days the planner skips this slot entirely.
 
-        - Optimistic (battery holds at 15%, rest of PV exports): exactly
-          what we want. This matches the user's expectation when they
-          asked for "charge only 15% of battery, rest sold."
-        - Pessimistic (battery drains to 15% to match target): same risk
-          profile as the previous Discharge slot — fine on sunny days,
-          bad on cloudy days where PV doesn't refill before evening.
-
-        We keep the helper name `_fill_stop_slot` for compatibility with
-        the planner's `stop_window` field — conceptually it's still the
-        "block-and-export morning window", just implemented with a
-        different strategy string and a low SOC ceiling.
+        Helper name `_fill_stop_slot` is preserved for compatibility with the
+        planner's `stop_window` field; conceptually it's the "block-and-export
+        morning window".
         """
         start_str = window.start.astimezone(RIGA_TZ).strftime("%H:%M")
         end_str = window.end.astimezone(RIGA_TZ).strftime("%H:%M")
@@ -409,12 +402,12 @@ class LivoltekClient:
 
         await self._fill_time_field("Start Time", slot_idx, start_str)
         await self._fill_time_field("End Time", slot_idx, end_str)
-        await self._select_strategy(slot_idx, "Charge")
+        await self._select_strategy(slot_idx, "Discharge")
         await self._set_slot_weekday(slot_idx, weekday)
         await self._fill_number_field("Power", slot_idx, "10.00")
         await self._fill_number_field("SOC", slot_idx, soc_target)
         log.info(
-            "livoltek.slot.morning_charge_low_soc_filled",
+            "livoltek.slot.morning_discharge_filled",
             slot=slot_idx,
             start=start_str,
             end=end_str,
