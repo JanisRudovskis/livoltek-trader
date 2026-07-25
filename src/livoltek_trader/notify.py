@@ -77,7 +77,9 @@ class NtfyClient:
             else:
                 response = await _post(self._client)
         except httpx.HTTPError as exc:
-            raise NtfyError(f"transport error: {exc}") from exc
+            raise NtfyError(
+                f"transport error: {type(exc).__name__}: {exc!r}"
+            ) from exc
 
         if not (200 <= response.status_code < 300):
             raise NtfyError(

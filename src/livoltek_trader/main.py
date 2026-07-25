@@ -70,7 +70,13 @@ async def _try_notify(ntfy: NtfyClient, *args, **kwargs) -> None:
     try:
         await ntfy.send(*args, **kwargs)
     except NtfyError as exc:
-        log.error("main.ntfy_failed", error=str(exc))
+        cause = exc.__cause__
+        log.error(
+            "main.ntfy_failed",
+            error=str(exc),
+            cause_type=type(cause).__name__ if cause else None,
+            cause_repr=repr(cause) if cause else None,
+        )
 
 
 async def _run(args: argparse.Namespace, settings: Settings) -> int:
