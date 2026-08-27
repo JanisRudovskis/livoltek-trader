@@ -28,7 +28,9 @@ test-results/
 storage_state.json
 browser-data/
 
-# Personal data — never commit (consumption, production exports, etc.)
+# Personal data — never commit (consumption, production exports, etc.).
+# Also covers data/exploration/, whose captured XHR payloads carry session
+# tokens, and data/telemetry/, the harvested history dumps.
 data/
 
 # Logs
