@@ -57,9 +57,12 @@ async def main() -> int:
     plan = _fake_plan()
     print(f"Smoke plan: {len(plan.cycles)} cycles")
     for i, c in enumerate(plan.cycles, 1):
+        # `discharge` is the DERIVED drain window (the hours the battery feeds
+        # the house after the charge), not a scheduled slot. Only the charge
+        # window is ever written to the portal.
         print(
             f"  Cycle {i}: charge {c.charge.start.time()}-{c.charge.end.time()} "
-            f"-> disch {c.discharge.start.time()}-{c.discharge.end.time()}"
+            f"-> drains {c.discharge.start.time()}-{c.discharge.end.time()}"
         )
     try:
         async with LivoltekClient() as client:

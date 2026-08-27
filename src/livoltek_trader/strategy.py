@@ -2,9 +2,25 @@
 
 Self-consumption arbitrage: charge the battery from the grid during cheap
 spot hours and use the stored energy in the household during expensive hours,
-avoiding a buy at the higher tariff. Supplier margin cancels in this mode,
-so net per-kWh benefit is the pure Nord Pool spread; the only cost we
-internalise is battery wear.
+avoiding a buy at the higher tariff.
+
+Two things about the accounting are easy to get wrong, and both were wrong
+here until 2026-08-27:
+
+1. **The discharge window is not a choice.** Once a Charge slot ends the
+   inverter returns to Self-use, so the battery covers household load
+   immediately and keeps going until empty (~7 h in winter). Value accrues
+   over the hours *directly following* the charge, not at the dearest block of
+   the day. Pairing a night charge with an evening peak is physically
+   impossible and used to inflate every plan.
+2. **The supplier margin does not fully cancel.** It cancels between the buy
+   and the avoided-buy legs, but we buy `battery_capacity_kwh` and only
+   deliver `cycle_output_kwh`, so the margin on round-trip losses is a real
+   cost (~€0.14/cycle at measured constants).
+
+Hardware constants in `config.py` are measured from portal telemetry, not
+nameplate figures. See
+`docs/superpowers/specs/2026-08-27-winter-grid-charging-design.md`.
 """
 
 from __future__ import annotations
@@ -43,7 +59,17 @@ class TradingWindow(BaseModel):
 
 
 class CyclePair(BaseModel):
-    """One charge window followed by one discharge window."""
+    """One grid charge window plus the drain window it is valued against.
+
+    Only `charge` is ever written to the inverter — it becomes a single
+    `Charge` slot. `discharge` is DERIVED, not scheduled: it is the run of
+    hours after the charge during which Self-use feeds the battery's energy
+    into household load. It exists for accounting and for the ntfy summary.
+
+    `gross_revenue_eur` is operating profit before wear — the formula nets out
+    the purchase cost, so despite the name it is not a revenue figure. Kept
+    for field compatibility; see `_build_cycle`.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -113,30 +139,85 @@ def _build_blocks(hourly: list[HourlyPrice], block_size: int) -> list[TradingWin
     return blocks
 
 
+def _derive_drain_window(
+    price_by_hour: dict[datetime, float],
+    charge: TradingWindow,
+    drain_hours: int,
+) -> TradingWindow | None:
+    """The hours the battery actually feeds the house after a charge ends.
+
+    This is NOT a choice. The moment a Charge slot ends the inverter returns
+    to Self-use, so the battery starts covering household load immediately and
+    keeps going until it is empty. The value of a charge is therefore realised
+    against the mean price of the hours directly following it — never against
+    the dearest block of the day.
+
+    Returns None unless `drain_hours` of *contiguous* price data exist after
+    `charge.end`. Valuing the full cycle output against a partial window would
+    overstate the cycle badly, since the battery cannot deliver 9 kWh into one
+    or two hours.
+    """
+    prices: list[float] = []
+    h = charge.end
+    for _ in range(drain_hours):
+        price = price_by_hour.get(h)
+        if price is None:
+            return None
+        prices.append(price)
+        h += timedelta(hours=1)
+    return TradingWindow(
+        start=charge.end,
+        end=h,
+        avg_eur_per_kwh=sum(prices) / len(prices),
+    )
+
+
 def _build_cycle(
-    charge: TradingWindow, discharge: TradingWindow, settings: Settings
+    charge: TradingWindow, drain: TradingWindow, settings: Settings
 ) -> CyclePair:
-    spread = discharge.avg_eur_per_kwh - charge.avg_eur_per_kwh
-    usable_kwh = settings.battery_capacity_kwh * settings.round_trip_efficiency
-    gross = spread * usable_kwh
+    """Value one charge window against its derived drain window.
+
+    We buy `battery_capacity_kwh` from the grid at the charge window's price
+    and avoid buying `cycle_output_kwh` at the drain window's price. The
+    supplier margin cancels between the two legs *except* on round-trip
+    losses, which is the `margin * (bought - delivered)` term — about €0.14
+    per cycle at measured constants, and omitted by the previous formula.
+    """
+    bought = settings.battery_capacity_kwh
+    delivered = settings.cycle_output_kwh
+    gross = (
+        delivered * drain.avg_eur_per_kwh
+        - bought * charge.avg_eur_per_kwh
+        - settings.buy_margin_eur_per_kwh * (bought - delivered)
+    )
     wear = settings.wear_cost_per_cycle_eur
     return CyclePair(
         charge=charge,
-        discharge=discharge,
+        discharge=drain,
         gross_revenue_eur=gross,
         wear_cost_eur=wear,
         net_profit_eur=gross - wear,
     )
 
 
-def _hours_of_cycle(cycle: CyclePair) -> set[datetime]:
-    """Return every clock hour occupied by either the charge or discharge window."""
+def _footprint(cycle: CyclePair) -> tuple[datetime, datetime]:
+    """Charge window plus the time the battery needs to empty again.
+
+    Two cycles may coexist only if their footprints are disjoint: a second
+    charge must not begin while the previous fill is still being consumed —
+    otherwise the plan books two full cycles of profit for one battery's worth
+    of energy. Half-open, so footprints touching exactly at the boundary are
+    allowed: the battery empties as the next charge begins.
+    """
+    return (cycle.charge.start, cycle.discharge.end)
+
+
+def _hours_in_span(span: tuple[datetime, datetime]) -> set[datetime]:
     hours: set[datetime] = set()
-    for window in (cycle.charge, cycle.discharge):
-        h = window.start
-        while h < window.end:
-            hours.add(h)
-            h += timedelta(hours=1)
+    h = span[0]
+    while h < span[1]:
+        hours.add(h)
+        h += timedelta(hours=1)
     return hours
 
 
@@ -217,22 +298,35 @@ def plan_day(
     settings: Settings | None = None,
     pv_forecast: PvForecast | None = None,
 ) -> DailyPlan:
-    """Pick the best disjoint set of up to `max_cycles_per_day` cycles for the day.
+    """Pick the best footprint-disjoint set of grid-charge cycles for the day.
 
-    Each cycle is a (charge_window, discharge_window) pair with discharge
-    starting at or after the charge ends; net profit (gross − wear) must clear
-    `min_net_profit_per_cycle_eur`. Candidates are sorted by net profit
-    descending and selected greedily — the highest-profit cycle that doesn't
-    overlap (hour-wise) any already chosen cycle is added, up to the cap.
+    Every rolling `hours_per_cycle` block is a charge candidate. Its drain
+    window is derived, not chosen (see `_derive_drain_window`), and the block
+    is dropped unless a full `battery_drain_hours` of contiguous prices follow
+    it. Net profit must clear `min_net_profit_per_cycle_eur`.
+
+    Candidates are sorted by net profit descending and selected greedily: a
+    cycle is added if its footprint — charge window plus drain time — does not
+    overlap any already chosen footprint. That is what prevents a second
+    charge from starting on a battery the first one just filled.
+
+    Greedy is a choice, not a requirement: this is weighted interval
+    scheduling, so one high-net cycle can block two mid-net ones. With a
+    ~9 hour footprint at most two cycles fit a day, so the conflict is rare
+    and an exact DP is not worth the code.
 
     If `pv_forecast` says expected PV meets or exceeds expected daily load
-    closely enough that grid imports fall below one cycle's output, the day
-    is skipped: the battery will fill from PV surplus for free and any
-    grid-charge cycle would waste wear without arbitrage value.
+    closely enough that grid imports fall below one cycle's output, cycles are
+    skipped: the battery will fill from PV surplus for free and any grid-charge
+    cycle would waste wear without arbitrage value. NOTE: this gate uses
+    `expected_daily_load_kwh`, a spring figure, so on shoulder-season days with
+    PV between (load − cycle_output) and load × 1.5 neither this branch nor the
+    sunny branch runs. Known gap, documented in the spec.
 
-    The Livoltek portal supports at most 6 schedule slots; with the
-    Charge-only approach (Self-use handles discharge implicitly), one cycle
-    maps to one Charge slot. `max_cycles_per_day` is bounded at 6 to match.
+    The Livoltek portal supports at most 6 schedule slots; one cycle maps to
+    one Charge slot, since Self-use handles the discharge implicitly.
+    `max_cycles_per_day` is bounded at 6 to match, though the footprint rule
+    binds well before the cap does.
     """
     settings = settings or get_settings()
 
@@ -267,21 +361,27 @@ def plan_day(
             )
 
     if cycle_skip_reason is None:
-        if len(hourly) < 2 * settings.hours_per_cycle:
+        # A cycle needs its charge block AND a full drain window inside the
+        # day's price data.
+        min_hours = settings.hours_per_cycle + settings.battery_drain_hours
+        if len(hourly) < min_hours:
             cycle_skip_reason = "not enough hourly data to form a cycle"
         else:
+            price_by_hour = {h.start: h.eur_per_kwh for h in hourly}
             blocks = _build_blocks(hourly, settings.hours_per_cycle)
             threshold = settings.min_net_profit_per_cycle_eur
 
             candidates: list[CyclePair] = []
-            for c in blocks:
-                for d in blocks:
-                    if d.start < c.end:
-                        continue
-                    cycle = _build_cycle(c, d, settings)
-                    if cycle.net_profit_eur < threshold:
-                        continue
-                    candidates.append(cycle)
+            for charge in blocks:
+                drain = _derive_drain_window(
+                    price_by_hour, charge, settings.battery_drain_hours
+                )
+                if drain is None:
+                    continue  # no full drain window — see _derive_drain_window
+                cycle = _build_cycle(charge, drain, settings)
+                if cycle.net_profit_eur < threshold:
+                    continue
+                candidates.append(cycle)
 
             if not candidates:
                 cycle_skip_reason = (
@@ -289,16 +389,15 @@ def plan_day(
                 )
             else:
                 candidates.sort(
-                    key=lambda c: (
-                        -c.net_profit_eur,
-                        c.charge.start,
-                        c.discharge.start,
-                    )
+                    key=lambda c: (-c.net_profit_eur, c.charge.start)
                 )
 
                 # Cap chosen cycles at 5 if a sunny-day Discharge slot might be
-                # added, so the 6-slot portal budget always has room. Cheap to
-                # do — drops at most one marginal cycle on sunny days.
+                # added, so the 6-slot portal budget always has room. Dead by
+                # arithmetic — the cycle branch needs PV below
+                # (load - cycle_output) while the sunny branch needs PV above
+                # load × 1.5, so they can never co-fire — but kept as
+                # belt-and-braces in case either gate is retuned.
                 pv_sunny = (
                     pv_forecast is not None
                     and pv_forecast.expected_kwh
@@ -309,15 +408,23 @@ def plan_day(
                 if pv_sunny:
                     cycle_cap = min(cycle_cap, 5)
 
+                spans: list[tuple[datetime, datetime]] = []
                 for cycle in candidates:
                     if len(chosen) >= cycle_cap:
                         break
-                    cycle_hours = _hours_of_cycle(cycle)
-                    if cycle_hours.isdisjoint(used_hours):
+                    span = _footprint(cycle)
+                    if all(
+                        span[0] >= s[1] or span[1] <= s[0] for s in spans
+                    ):
                         chosen.append(cycle)
-                        used_hours.update(cycle_hours)
+                        spans.append(span)
 
                 chosen.sort(key=lambda c: c.charge.start)
+                # The Stop planner must not place a Discharge-to-grid slot
+                # inside a window where the battery is charging or feeding the
+                # house.
+                for span in spans:
+                    used_hours.update(_hours_in_span(span))
 
     # Morning Discharge window: only on sunny days where PV clearly exceeds
     # load by the configured safety margin. Below this gate we trust Self-use

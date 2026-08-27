@@ -15,13 +15,72 @@ class Settings(BaseSettings):
     elering_region: str = Field(default="lv")
     elering_timeout_s: float = Field(default=15.0)
 
-    battery_capacity_kwh: float = Field(default=10.24, gt=0.0)
-    round_trip_efficiency: float = Field(default=0.90, gt=0.0, le=1.0)
+    battery_capacity_kwh: float = Field(default=11.63, gt=0.0)
+    """Grid energy bought to take the battery from 10% to 100% SOC.
+
+    MEASURED, provisionally. One clean grid-charge episode (2026-08-22,
+    SOC 25→84 at 7.6 kW, avoiding both the bottom and the >90% taper) gives
+    0.1292 kWh per SOC point. Only 3 grid charges exist in 148 days of
+    history because the summer PV gate suppresses them, so re-measure in
+    November once autumn grid charging has produced dozens. Deliberately the
+    pessimistic end of the 10.74–11.63 band: erring high on cost is safe.
+
+    NOT the nameplate capacity (10.24 kWh nominal) — this is grid-side energy
+    including charge losses, which is what the economics need.
+    """
+    round_trip_efficiency: float = Field(default=0.764, gt=0.0, le=1.0)
+    """Measured grid-to-house round trip, so `cycle_output_kwh` ≈ 8.885 kWh.
+
+    The discharge side is solid: 147 PV-free discharge episodes, median
+    0.0987 kWh per SOC point, i.e. 8.88 kWh delivered over a 90-point swing.
+    The charge side carries the uncertainty (see `battery_capacity_kwh`).
+    Previously assumed 0.90, which overstated every cycle.
+    """
     battery_price_eur: float = Field(default=3000.0, ge=0.0)
     battery_cycle_life: int = Field(default=6000, gt=0)
     max_cycles_per_day: int = Field(default=6, ge=0, le=6)
     hours_per_cycle: int = Field(default=2, ge=1)
+    """Length of a Charge window in hours. Sizes the charge block only —
+    the discharge side is derived from `battery_drain_hours`, not chosen."""
+    battery_drain_hours: int = Field(default=7, ge=1, le=12)
+    """Hours a full battery feeds the house before it is empty.
+
+    Sets the window a Charge slot is valued against, and the spacing between
+    consecutive charges. Deliberately the LONG end of the measured 3.6–7.1 h
+    winter range, because the two errors are not symmetric:
+
+    - too SHORT attributes all output to the first, dearest hours when part of
+      it is really delivered later at cheap prices → over-values the cycle and
+      books cycles that lose money. No gate protects against this, since the
+      figure is inflated before the gate sees it.
+    - too LONG dilutes with hours where the battery is already empty →
+      under-values, forgoing profit but never losing money.
+
+    Currently pinned to an unmeasured winter load — the largest single
+    uncertainty in the model, worth roughly a 2x swing in daily value. The
+    system has never seen a winter (inverter data begins 2026-04-01), so this
+    can only be measured from real cold weather.
+
+    Upper bound 12: larger values silently drop every candidate block and the
+    planner goes dark behind a misleading "no cycle nets ..." skip reason.
+    """
     min_net_profit_per_cycle_eur: float = Field(default=0.25)
+    """Minimum net profit for a cycle to be worth scheduling.
+
+    Originally justified as a ±0.18 EUR allowance for price-forecast error,
+    which was always shaky — Elering day-ahead prices for the target day are
+    exact, not forecast. Its real job now is to absorb `battery_drain_hours`
+    model error, which dominates. Lowering it to ~0.14 would restore the old
+    effective strictness now that the valuation is honest, but that trade is
+    only worth making once the drain window has been measured.
+    """
+    buy_margin_eur_per_kwh: float = Field(default=0.05, ge=0.0)
+    """Supplier margin added to spot on every imported kWh.
+
+    A tariff fact, not a tuning knob. Needed so a cycle is charged the margin
+    on its round-trip losses: `margin * (capacity - output)` ≈ 0.137 EUR per
+    cycle at measured constants. The current code omits this entirely.
+    """
     stop_sell_threshold_eur_per_kwh: float = Field(default=0.02, ge=0.0)
     """Minimum spot price for a Stop slot to be worth adding.
 

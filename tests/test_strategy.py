@@ -10,7 +10,6 @@ from livoltek_trader.config import Settings
 from livoltek_trader.elering import PricePeriod
 from livoltek_trader.solar import PvForecast
 from livoltek_trader.strategy import (
-    CyclePair,
     DailyPlan,
     HourlyPrice,
     TradingWindow,
@@ -32,6 +31,8 @@ def settings() -> Settings:
         battery_cycle_life=6000,
         max_cycles_per_day=2,
         hours_per_cycle=2,
+        battery_drain_hours=7,
+        buy_margin_eur_per_kwh=0.05,
         min_net_profit_per_cycle_eur=0.10,
     )
 
@@ -122,12 +123,30 @@ def test_build_blocks_avg_is_arithmetic_mean():
 
 def test_build_cycle_profit_math(settings):
     charge = TradingWindow(start=_hour(9, 2), end=_hour(9, 4), avg_eur_per_kwh=0.05)
-    discharge = TradingWindow(start=_hour(9, 18), end=_hour(9, 20), avg_eur_per_kwh=0.30)
-    cycle = _build_cycle(charge, discharge, settings)
-    # spread 0.25 * usable 5 kWh * eff 1.0 = 1.25 €; wear 3000/6000 = 0.50; net = 0.75
+    drain = TradingWindow(start=_hour(9, 4), end=_hour(9, 11), avg_eur_per_kwh=0.30)
+    cycle = _build_cycle(charge, drain, settings)
+    # bought 5 @ 0.05 = 0.25; delivered 5 @ 0.30 = 1.50; losses 0 so no margin
+    # term; wear 3000/6000 = 0.50 => gross 1.25, net 0.75
     assert cycle.gross_revenue_eur == pytest.approx(1.25)
     assert cycle.wear_cost_eur == pytest.approx(0.50)
     assert cycle.net_profit_eur == pytest.approx(0.75)
+
+
+def test_build_cycle_charges_full_capacity_and_margin_on_losses(settings):
+    """With round-trip losses, we buy more than we deliver and pay margin on
+    the difference. The old spread formula ignored both."""
+    lossy = settings.model_copy(update={"round_trip_efficiency": 0.5})
+    charge = TradingWindow(start=_hour(9, 2), end=_hour(9, 4), avg_eur_per_kwh=0.05)
+    drain = TradingWindow(start=_hour(9, 4), end=_hour(9, 11), avg_eur_per_kwh=0.55)
+
+    lossless_gross = _build_cycle(charge, drain, settings).gross_revenue_eur
+    lossy_gross = _build_cycle(charge, drain, lossy).gross_revenue_eur
+
+    # lossless: 5 * 0.55 - 5 * 0.05 - 0        = 2.50
+    # lossy   : 2.5 * 0.55 - 5 * 0.05 - 0.05*2.5 = 1.00
+    assert lossless_gross == pytest.approx(2.50)
+    assert lossy_gross == pytest.approx(1.00)
+    assert lossy_gross < lossless_gross
 
 
 # --- plan_day -----------------------------------------------------------------
@@ -148,7 +167,14 @@ def test_plan_day_skips_when_no_cycle_meets_threshold(settings):
     assert plan.total_net_profit_eur == 0.0
 
 
-def test_plan_day_picks_cheapest_charge_and_dearest_discharge(settings):
+def test_plan_day_derives_discharge_from_charge_not_from_dearest_block(settings):
+    """The dearest block of the day is NOT the discharge window.
+
+    Previously the planner paired the cheapest charge with the dearest block
+    anywhere later in the day (here 18-20 at 0.80) and booked the full spread.
+    The battery cannot hold its charge that long, so the discharge window is
+    now derived: the hours immediately following the charge.
+    """
     settings = settings.model_copy(update={"max_cycles_per_day": 1})
     prices = [0.50] * 24
     prices[2] = 0.05
@@ -161,10 +187,12 @@ def test_plan_day_picks_cheapest_charge_and_dearest_discharge(settings):
     cycle = plan.cycles[0]
     assert cycle.charge.start == _hour(9, 2)
     assert cycle.charge.end == _hour(9, 4)
-    assert cycle.discharge.start == _hour(9, 18)
-    assert cycle.discharge.end == _hour(9, 20)
     assert cycle.charge.avg_eur_per_kwh == pytest.approx(0.05)
-    assert cycle.discharge.avg_eur_per_kwh == pytest.approx(0.80)
+    # Derived: starts where the charge ends, runs battery_drain_hours, and is
+    # valued at 0.50 — the actual price of those hours, not the 0.80 peak.
+    assert cycle.discharge.start == _hour(9, 4)
+    assert cycle.discharge.end == _hour(9, 11)
+    assert cycle.discharge.avg_eur_per_kwh == pytest.approx(0.50)
 
 
 def test_plan_day_finds_two_cycles_when_profitable(settings):
@@ -200,9 +228,10 @@ def test_plan_day_respects_max_cycles_zero(settings):
     assert plan.cycles == []
 
 
-def test_plan_day_enforces_temporal_order(settings):
-    # Cheap at midday, expensive at evening. Algorithm must charge first
-    # and discharge later — the reverse would be more profitable but causal.
+def test_plan_day_discharge_always_begins_where_charge_ends(settings):
+    # Cheap at midday, expensive at evening. Temporal order is now structural:
+    # the drain window starts at charge.end by construction, so it can never
+    # precede the charge.
     settings = settings.model_copy(update={"max_cycles_per_day": 1})
     prices = [0.30] * 24
     prices[12:14] = [0.05, 0.05]
@@ -211,9 +240,10 @@ def test_plan_day_enforces_temporal_order(settings):
     plan = plan_day(hourly, date(2026, 5, 9), settings)
     assert len(plan.cycles) == 1
     cycle = plan.cycles[0]
-    assert cycle.charge.start < cycle.discharge.start
     assert cycle.charge.start.hour == 12
-    assert cycle.discharge.start.hour == 20
+    assert cycle.charge.start < cycle.discharge.start
+    assert cycle.discharge.start == cycle.charge.end
+    assert cycle.discharge.end == cycle.charge.end + timedelta(hours=7)
 
 
 def test_plan_day_subtracts_wear_when_below_breakeven(settings):
@@ -226,17 +256,21 @@ def test_plan_day_subtracts_wear_when_below_breakeven(settings):
     assert plan.cycles == []  # wear-negative => skipped
 
 
-def test_plan_day_efficiency_reduces_revenue(settings):
-    settings = settings.model_copy(update={"round_trip_efficiency": 0.5})
-    # spread 0.50; usable = 5 * 0.5 = 2.5 kWh; rev = 1.25; wear = 0.50; net = 0.75
+def test_plan_day_poor_efficiency_can_kill_an_otherwise_viable_day(settings):
+    """Halving round-trip efficiency turns a profitable day into no plan.
+
+    Same prices, same gate: at full efficiency the cycle clears, at 0.5 it
+    does not, because we still buy the full capacity but deliver half.
+    """
     prices = [0.30] * 24
     prices[2:4] = [0.05, 0.05]
     prices[20:22] = [0.55, 0.55]
     hourly = _hourly_series(9, prices)
-    plan = plan_day(hourly, date(2026, 5, 9), settings)
-    assert len(plan.cycles) == 1
-    assert plan.cycles[0].gross_revenue_eur == pytest.approx(1.25)
-    assert plan.cycles[0].net_profit_eur == pytest.approx(0.75)
+
+    assert plan_day(hourly, date(2026, 5, 9), settings).cycles
+
+    lossy = settings.model_copy(update={"round_trip_efficiency": 0.5})
+    assert plan_day(hourly, date(2026, 5, 9), lossy).cycles == []
 
 
 # --- PV-aware planning -------------------------------------------------------
@@ -310,60 +344,52 @@ def test_plan_day_without_pv_forecast_behaves_as_before(settings):
 # --- max-six-cycle cap ------------------------------------------------------
 
 
-def _cycle_hours(c: CyclePair) -> set[datetime]:
-    hours: set[datetime] = set()
-    for w in (c.charge, c.discharge):
-        h = w.start
-        while h < w.end:
-            hours.add(h)
-            h = h + timedelta(hours=1)
-    return hours
+def _alternating_prices() -> list[float]:
+    """12 two-hour blocks alternating cheap/dear."""
+    return [0.05 if (h // 2) % 2 == 0 else 0.80 for h in range(24)]
 
 
-def test_plan_day_caps_at_max_cycles_per_day_six(settings):
-    # 12 two-hour blocks alternating cheap/dear lets us fit exactly 6 cycles.
-    settings = settings.model_copy(update={"max_cycles_per_day": 6})
-    prices = [0.0] * 24
-    for h in range(24):
-        prices[h] = 0.05 if (h // 2) % 2 == 0 else 0.80
-    hourly = _hourly_series(9, prices)
-    plan = plan_day(hourly, date(2026, 5, 9), settings)
-    assert len(plan.cycles) == 6, f"expected 6 cycles, got {len(plan.cycles)}"
+def test_plan_day_footprint_not_the_cap_is_what_limits_cycles(settings):
+    """A 9 h footprint (2 h charge + 7 h drain) leaves room for only 2 cycles.
+
+    This replaces the old six-cycle test, which asserted that six phantom
+    back-to-back night charges were correct: they were hour-disjoint but each
+    began on a battery the previous charge had just filled, so the plan booked
+    six cycles of profit for one battery's worth of energy.
+    """
+    generous = settings.model_copy(update={"max_cycles_per_day": 6})
+    hourly = _hourly_series(9, _alternating_prices())
+    plan = plan_day(hourly, date(2026, 5, 9), generous)
+
+    assert len(plan.cycles) == 2, f"expected 2, got {len(plan.cycles)}"
     starts = [c.charge.start for c in plan.cycles]
     assert starts == sorted(starts), "cycles must be returned in time order"
-    used: set[datetime] = set()
-    for c in plan.cycles:
-        for h in _cycle_hours(c):
-            assert h not in used, f"overlap detected at {h}"
-            used.add(h)
+    assert starts == [_hour(9, 0), _hour(9, 12)]
 
 
-def test_plan_day_cap_can_be_lower_than_six(settings):
-    settings = settings.model_copy(update={"max_cycles_per_day": 3})
-    prices = [0.0] * 24
-    for h in range(24):
-        prices[h] = 0.05 if (h // 2) % 2 == 0 else 0.80
-    hourly = _hourly_series(9, prices)
-    plan = plan_day(hourly, date(2026, 5, 9), settings)
-    assert len(plan.cycles) == 3
-
-
-def test_plan_day_greedy_drops_lower_profit_cycles_competing_for_same_window(settings):
-    # Only one dear window; multiple cheap windows compete for it. Greedy
-    # should pick the cycle with the cheapest charge (highest spread) and
-    # discard the rest — no other profitable pairing remains.
-    settings = settings.model_copy(update={"max_cycles_per_day": 6})
-    prices = [0.50] * 24
-    prices[2] = 0.05
-    prices[3] = 0.05   # cheapest charge candidate
-    prices[20] = 0.90
-    prices[21] = 0.90  # the only dear window
-    hourly = _hourly_series(9, prices)
-    plan = plan_day(hourly, date(2026, 5, 9), settings)
+def test_plan_day_cap_binds_below_the_structural_limit(settings):
+    """max_cycles_per_day still applies when set below what would fit."""
+    capped = settings.model_copy(update={"max_cycles_per_day": 1})
+    hourly = _hourly_series(9, _alternating_prices())
+    plan = plan_day(hourly, date(2026, 5, 9), capped)
     assert len(plan.cycles) == 1
-    chosen = plan.cycles[0]
-    assert chosen.charge.start.hour == 2
-    assert chosen.discharge.start.hour == 20
+
+
+def test_plan_day_greedy_prefers_higher_net_over_cheaper_charge(settings):
+    """When footprints collide, the highest net wins — not the cheapest charge.
+
+    00-02 is the cheapest block of the day, but its drain window catches only
+    two of the expensive hours. 02-04 costs more to charge yet drains entirely
+    across the dear run, so it nets more and displaces 00-02.
+    """
+    generous = settings.model_copy(update={"max_cycles_per_day": 6})
+    prices = [0.05, 0.05, 0.06, 0.06] + [0.60] * 7 + [0.20] * 13
+    assert len(prices) == 24
+    hourly = _hourly_series(9, prices)
+    plan = plan_day(hourly, date(2026, 5, 9), generous)
+
+    assert len(plan.cycles) == 1
+    assert plan.cycles[0].charge.start == _hour(9, 2)
 
 
 # --- Stop slot (block-and-export) -----------------------------------------
@@ -556,6 +582,210 @@ def test_plan_day_returns_empty_plan_on_flat_low_pv_day(settings):
     assert plan.stop_window is None
     assert plan.is_empty
     assert plan.skipped_reason is not None
+
+
+# --- drain-anchored valuation (spec rev3 Part 1) -----------------------------
+#
+# Expected numbers below were computed independently of the implementation from
+# the formula in spec section 4.2, using the shipping defaults:
+#   capacity 11.63, RTE 0.764 -> output 8.88532, margin 0.05, wear 0.50
+#   loss-margin term = 0.05 * (11.63 - 8.88532) = 0.137234
+
+
+MEASURED_CAPACITY = 11.63
+MEASURED_RTE = 0.764
+MEASURED_OUTPUT = MEASURED_CAPACITY * MEASURED_RTE  # 8.88532
+
+
+@pytest.fixture
+def measured() -> Settings:
+    """Shipping hardware constants, stated explicitly so .env cannot alter them."""
+    return Settings(
+        battery_capacity_kwh=MEASURED_CAPACITY,
+        round_trip_efficiency=MEASURED_RTE,
+        battery_price_eur=3000.0,
+        battery_cycle_life=6000,
+        max_cycles_per_day=6,
+        hours_per_cycle=2,
+        battery_drain_hours=7,
+        buy_margin_eur_per_kwh=0.05,
+        min_net_profit_per_cycle_eur=0.25,
+    )
+
+
+def _reference_day_prices() -> list[float]:
+    """Ordinary Latvian winter shape: cheap night, morning and evening peaks."""
+    return (
+        [0.05] * 6 + [0.12] + [0.22] * 3 + [0.13] * 6 + [0.18]
+        + [0.26] * 4 + [0.10] * 3
+    )
+
+
+def test_config_defaults_are_the_measured_hardware_constants():
+    # Read class defaults, not an instance — an instance would absorb .env.
+    f = Settings.model_fields
+    assert f["battery_capacity_kwh"].default == pytest.approx(11.63)
+    assert f["round_trip_efficiency"].default == pytest.approx(0.764)
+    assert f["battery_drain_hours"].default == 7
+    assert f["buy_margin_eur_per_kwh"].default == pytest.approx(0.05)
+
+
+def test_plan_day_golden_reference_day(measured):
+    hourly = _hourly_series(9, _reference_day_prices())
+    plan = plan_day(hourly, date(2026, 5, 9), measured)
+
+    assert len(plan.cycles) == 1
+    cycle = plan.cycles[0]
+    assert cycle.charge.start == _hour(9, 4)
+    assert cycle.charge.end == _hour(9, 6)
+    assert cycle.net_profit_eur == pytest.approx(0.2663837714, abs=1e-6)
+    assert plan.total_net_profit_eur == pytest.approx(0.2663837714, abs=1e-6)
+
+
+def test_plan_day_drain_assumption_changes_valuation(measured):
+    """Same day at a 4 h assumption books ~2x the value for one physical cycle.
+
+    This is the argument for choosing the long end of the drain range: the
+    shorter assumption attributes all output to the first, dearest hours.
+    """
+    hourly = _hourly_series(9, _reference_day_prices())
+    short = measured.model_copy(update={"battery_drain_hours": 4})
+    plan = plan_day(hourly, date(2026, 5, 9), short)
+
+    assert len(plan.cycles) == 1
+    assert plan.cycles[0].charge.start == _hour(9, 4)
+    assert plan.total_net_profit_eur == pytest.approx(0.5139034, abs=1e-6)
+
+
+def test_derived_drain_window_is_the_hours_following_the_charge(measured):
+    hourly = _hourly_series(9, _reference_day_prices())
+    cycle = plan_day(hourly, date(2026, 5, 9), measured).cycles[0]
+
+    assert cycle.discharge.start == cycle.charge.end
+    assert cycle.discharge.end == cycle.charge.end + timedelta(hours=7)
+    # Mean of hours 06..12 inclusive.
+    assert cycle.discharge.avg_eur_per_kwh == pytest.approx(1.17 / 7)
+
+
+def test_plan_day_drops_charge_block_without_a_full_drain_window(measured):
+    """A late charge with only 4 following hours is dropped, not part-valued.
+
+    Hours 18-19 are nearly free and 20-23 are dear, so valuing the block
+    against a partial window would book a huge, unrealisable profit: the
+    battery cannot deliver its whole output into four hours.
+    """
+    prices = [0.30] * 18 + [0.02] * 2 + [0.60] * 4
+    assert len(prices) == 24
+    hourly = _hourly_series(9, prices)
+
+    assert plan_day(hourly, date(2026, 5, 9), measured).cycles == [], (
+        "no block leaves 7 contiguous drain hours, so nothing is tradeable"
+    )
+
+    # Same day with a 4 h drain: the window now fits and the cycle is taken.
+    # This proves the rejection above comes from the window length, not from
+    # the prices being unattractive.
+    short = measured.model_copy(update={"battery_drain_hours": 4})
+    taken = plan_day(hourly, date(2026, 5, 9), short)
+    assert len(taken.cycles) == 1
+    assert taken.cycles[0].charge.start == _hour(9, 18)
+
+
+def test_plan_day_rejects_overlapping_footprints(measured):
+    """Two night charges 3 h apart cannot both be chosen.
+
+    This replaces the old six-cycle cap test, which asserted that phantom
+    back-to-back night charges were correct.
+    """
+    hourly = _hourly_series(9, _reference_day_prices())
+    plan = plan_day(hourly, date(2026, 5, 9), measured)
+
+    spans = [
+        (c.charge.start, c.charge.end + timedelta(hours=7)) for c in plan.cycles
+    ]
+    for i, a in enumerate(spans):
+        for b in spans[i + 1 :]:
+            assert a[0] >= b[1] or a[1] <= b[0], f"footprints overlap: {a} {b}"
+
+
+def test_plan_day_allows_footprints_touching_at_the_boundary(measured):
+    """A charge starting exactly when the previous fill runs out is allowed."""
+    prices = (
+        [0.05] * 2 + [0.25] * 7      # charge 00-02, drain 02-09
+        + [0.05] * 2 + [0.25] * 7    # charge 09-11, drain 11-18
+        + [0.10] * 6
+    )
+    assert len(prices) == 24
+    hourly = _hourly_series(9, prices)
+    plan = plan_day(hourly, date(2026, 5, 9), measured)
+
+    starts = [c.charge.start for c in plan.cycles]
+    assert starts == [_hour(9, 0), _hour(9, 9)]
+    # The derived drain windows must span the full 7 h, so the first cycle's
+    # footprint ends exactly where the second charge begins.
+    assert plan.cycles[0].discharge.end == _hour(9, 9)
+    assert plan.cycles[1].discharge.end == _hour(9, 18)
+
+
+def test_plan_day_prefers_block_adjacent_to_peak_over_globally_cheapest(measured):
+    """The cheapest hours of the day lose if the battery empties before the peak."""
+    prices = [0.01] * 4 + [0.11] * 16 + [0.40] * 4
+    assert len(prices) == 24
+    hourly = _hourly_series(9, prices)
+    short = measured.model_copy(update={"battery_drain_hours": 4})
+    plan = plan_day(hourly, date(2026, 5, 9), short)
+
+    assert len(plan.cycles) == 1
+    # 18-20 charges at 0.11 and drains across the 0.40 run; 00-02 is four times
+    # cheaper but its drain window never sees an expensive hour.
+    assert plan.cycles[0].charge.start == _hour(9, 18)
+
+
+def test_plan_day_charges_buy_margin_on_round_trip_losses(measured):
+    """The margin paid on losses alone can push a cycle below the gate."""
+    prices = [0.05] * 2 + [0.1554] * 7 + [0.05] * 15
+    assert len(prices) == 24
+    hourly = _hourly_series(9, prices)
+
+    without_margin = measured.model_copy(
+        update={"buy_margin_eur_per_kwh": 0.0}
+    )
+    assert plan_day(hourly, date(2026, 5, 9), without_margin).cycles, (
+        "cycle should clear the gate when losses carry no margin"
+    )
+    assert plan_day(hourly, date(2026, 5, 9), measured).cycles == [], (
+        "the 0.137 EUR margin on round-trip losses must sink this cycle"
+    )
+
+
+def test_plan_day_rejects_peak_then_crash_day(measured):
+    """Calm morning peak followed by a windy midday crash must not be traded.
+
+    At a 4 h assumption this books +0.36 EUR; the real 7 h drain runs into the
+    0.02 EUR crash and loses money. Regression guard against shortening
+    battery_drain_hours without measuring it first.
+    """
+    prices = [0.13] * 4 + [0.09] * 2 + [0.30] * 3 + [0.02] * 5 + [0.12] * 10
+    assert len(prices) == 24
+    hourly = _hourly_series(9, prices)
+
+    assert plan_day(hourly, date(2026, 5, 9), measured).cycles == []
+
+    short = measured.model_copy(update={"battery_drain_hours": 4})
+    optimistic = plan_day(hourly, date(2026, 5, 9), short)
+    assert len(optimistic.cycles) == 1
+    assert optimistic.total_net_profit_eur == pytest.approx(0.35969, abs=1e-5)
+
+
+def test_plan_day_handles_negative_prices(measured):
+    """Being paid to charge is profitable and must not break the arithmetic."""
+    prices = [-0.10] * 4 + [0.05] * 20
+    hourly = _hourly_series(9, prices)
+    plan = plan_day(hourly, date(2026, 5, 9), measured)
+
+    assert len(plan.cycles) == 1
+    assert plan.cycles[0].charge.start == _hour(9, 2)
+    assert plan.cycles[0].net_profit_eur == pytest.approx(0.970032, abs=1e-5)
 
 
 def test_daily_plan_is_empty_property():

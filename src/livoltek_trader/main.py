@@ -91,10 +91,20 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
 
     ntfy = NtfyClient(settings)
 
+    # PV is advisory: it only gates whether cycles/Stop slots are worth it, and
+    # `plan_day` accepts None. A winter plan barely depends on it. So an
+    # Open-Meteo outage degrades to a PV-blind plan rather than costing the
+    # whole night's schedule.
+    pv = None
     try:
         pv = await fetch_pv_forecast(target_date, settings=settings)
+    except OpenMeteoAPIError as exc:
+        log.warning("main.pv_forecast_failed_planning_blind", error=str(exc))
+
+    # Prices are not optional — without them there is nothing to plan.
+    try:
         periods = await fetch_day_ahead(target_date, settings=settings)
-    except (ElerinAPIError, OpenMeteoAPIError) as exc:
+    except ElerinAPIError as exc:
         log.error("main.fetch_failed", error=str(exc))
         title, body, prio = format_error_message("fetch", exc)
         await _try_notify(ntfy, body, title=title, priority=prio, tags=["warning"])

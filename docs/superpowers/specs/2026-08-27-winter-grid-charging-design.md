@@ -1,8 +1,8 @@
 # Winter grid-charging: honest cycle valuation and drain-anchored charge placement
 
 **Date:** 2026-08-27
-**Status:** Part 1 approved for implementation; business case downgraded — see §3.3
-**Revision:** rev3 — rebuilt on measured telemetry. See §9 for the revision trail.
+**Status:** Part 1 implemented and green (87 tests). November re-measurement outstanding — see §5.3
+**Revision:** rev4 — Part 1 implemented; economics backtested. See §9 for the trail.
 **Scope:** `strategy.py`, `config.py`, `tests/test_strategy.py`. Telemetry turned
 out to need no new production code at all (§5).
 
@@ -48,8 +48,9 @@ charge just filled. The sin is not physical no-op-ness (with a multi-hour drain
 they do partially charge); it is booking three full cycles of profit for one
 battery's worth of energy.
 
-`tests/test_strategy.py::test_plan_day_caps_at_max_cycles_per_day_six` (line 323)
-encodes this as correct and must be rewritten.
+`tests/test_strategy.py::test_plan_day_caps_at_max_cycles_per_day_six` encoded
+this as correct; it has been replaced by
+`test_plan_day_footprint_not_the_cap_is_what_limits_cycles`.
 
 ### 1.4 Combined effect
 
@@ -121,12 +122,21 @@ not starting at 100 %.
 
 **`battery_drain_hours = 7`** — the warm-winter end, i.e. the safe end.
 
-The cost is real and concentrated where it hurts: on cold days true drain is
-~3.6 h, so a 7 h assumption dilutes the peak with 3.4 empty hours and rejects
-exactly the best cycles of the coldest, highest-spread days. On the reference day
-the constant swings the result between €0.51 (at 4 h) and €0.27 (at 7 h) — a 1.9×
-lever, the largest single uncertainty in the model. §5.4 replaces it with a
-measurement in November.
+On the synthetic reference day the constant swings the result between €0.51
+(at 4 h) and €0.27 (at 7 h), which looks like a 1.9× lever.
+
+**Corrected against real prices:** the backtest in §3.3 shows the aggregate
+effect runs the *other* way — over 59 real winter days, assuming 4 h yields
+**less** (€9.65 across 14 days) than assuming 7 h (€10.72 across 17 days). Real
+price shapes put peaks further from the cheapest hours than the synthetic day
+does, so a 4 h window often fails to reach the peak at all while a 7 h window
+still averages high enough to clear the gate. An earlier revision of this
+document claimed a shorter drain would "roughly double" the value; that was
+extrapolated from one hand-built day and is wrong.
+
+The constant is still the right one to measure — it decides which windows are
+chosen and how many fit — but it is not the dominant lever on total value, and
+choosing the long end costs less than feared. §5.4 measures it in November.
 
 A robust min-over-range valuation (require the gate to clear at both 4 h and 7 h)
 was considered and dropped: on every case tested it selects identically to using
@@ -221,34 +231,44 @@ The user's original sketch item 4 ("export at the morning peak") is dropped. The
 summer sunny-day Discharge slot already covers the case where export does pay:
 when PV, not the grid, filled the battery for free.
 
-### 3.3 Expected value — downgraded, and this is the headline
+### 3.3 Backtested on 59 real winter days — the current code loses money
 
-On the reference day (§4.4) — a perfectly ordinary winter shape with €0.05 nights
-and a €0.26 evening peak — the honest plan is **one cycle worth €0.265**, barely
-clearing the gate.
+`scripts/backtest_strategy.py` replays both algorithms over real Elering
+day-ahead prices for 2026-01-01 … 2026-02-28 (PV ignored, which is faithful for
+deep winter where the PV gate never fires).
 
-Three things eat the margin: €0.50 wear per cycle, a 0.76 round-trip, and the
-€0.07/kWh tariff asymmetry. Together they demand a €0.115/kWh spread before a
-cycle pays at all.
+| | Days it fires | Cycles | Total | Per month |
+|---|---|---|---|---|
+| New planner, `drain_hours` = 7 | 17 / 59 | 17 | €10.72 | **€5.45** |
+| New planner, `drain_hours` = 4 | 14 / 59 | 14 | €9.65 | €4.91 |
+| Current code, as it reports itself | ~45 / 59 | 110 | €106.07 | €53.93 |
+| **Current code, re-valued honestly** | — | 110 | **−€14.90** | **−€7.58** |
 
-Realistic expectation: **€5–15/month across a Latvian winter**, with wide
-uncertainty, and quite possibly less. The previous estimates in this document
-(€20/month in rev1, €10–25 in rev2) were built on unmeasured hardware constants
-and an arithmetically wrong reference day.
+Three findings, in order of importance:
 
-Two measurements could move this materially, both due in November:
+1. **The current production code is losing money every winter.** It schedules
+   110 cycles across two months — €55 of battery wear — for a genuinely negative
+   return. Re-valuing its own chosen charge windows against their real drain
+   windows gives −€14.90. It reports €106.07.
+2. **The fix is worth ~€13/month, and almost all of that comes from NOT
+   trading.** €5.45 earned plus €7.58 of losses avoided. The new planner
+   schedules 17 cycles where the old one schedules 110, so wear drops from €55
+   to €8.50 over the same period.
+3. **Earning from winter arbitrage is thin: ~€5.45/month, firing on 29 % of
+   days,** median €0.43 on a day that fires and €1.32 at best. Worth having, not
+   worth much complexity. The overstatement factor on real data is **9.9×**.
+
+The sign of finding 1 is robust to the drain-window uncertainty: the new planner
+found only €19.22 of honest *gross* across the 17 best windows in 59 days, so
+110 cycles carrying €55 of wear cannot have been positive under any plausible
+drain assumption.
+
+Two measurements are still due in November (§5.3), but neither changes the
+decision to ship:
 
 - If the true round-trip is 0.83 rather than 0.76, cycle value rises ~30 %.
-- If true winter drain is 4 h rather than 7 h, cycle value roughly doubles.
-
-Both landing favourably would make the mechanism clearly worthwhile. Both landing
-badly would mean grid arbitrage on this hardware is not worth the wear, and the
-right answer would be to leave ToU off in winter and let Self-use run.
-
-**Shipping Part 1 is still correct regardless**, for two reasons that do not
-depend on the business case: the current code books profits that do not exist and
-places charges in the wrong hours, and running the honest version through autumn
-is what generates the grid-charge episodes needed to settle §2.3.
+- The drain constant matters less in aggregate than the reference day suggested
+  — see the correction in §2.1.
 
 ---
 
@@ -574,6 +594,21 @@ season this spec addresses.
 ---
 
 ## 9. Revision history
+
+**rev4 (2026-08-27)** — Part 1 implemented; spec corrected by backtest.
+
+- **Backtested on 59 real winter days** (`scripts/backtest_strategy.py`). The
+  current production code, re-valued honestly, returns **−€14.90** while
+  reporting €106.07: it schedules 110 cycles (€55 of wear) for a negative
+  return. The fix is worth ~€13/month, mostly by not trading (§3.3).
+- **rev3's claim that a 4 h drain would "roughly double" value is wrong.** On
+  real prices, assuming 4 h yields *less* than 7 h. Corrected in §2.1.
+- Earning expectation narrowed from "€5–15/month" to **€5.45/month, firing on
+  29 % of days** — measured, not estimated.
+- Implemented: `strategy.py` (drain derivation, honest valuation, footprint
+  spacing, `_hours_of_cycle` removed), `config.py` (measured constants plus
+  `battery_drain_hours` and `buy_margin_eur_per_kwh`), §7.1 resilience fix in
+  `main.py`, and the test suite from §7 (87 tests green).
 
 **rev3 (2026-08-27)** — rebuilt on 148 days of harvested telemetry.
 
