@@ -102,15 +102,24 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
 
     ntfy = NtfyClient(settings)
 
-    # PV is advisory: it only gates whether cycles/Stop slots are worth it, and
-    # `plan_day` accepts None. A winter plan barely depends on it. So an
-    # Open-Meteo outage degrades to a PV-blind plan rather than costing the
-    # whole night's schedule.
+    # An Open-Meteo outage must not cost the whole night's run, but it must not
+    # be planned through either: without PV we cannot tell whether the sun will
+    # fill the battery for free, and paying for a grid charge that displaces
+    # nothing is the expensive mistake. So the run continues and `plan_day`
+    # suppresses cycles, leaving the inverter on plain Self-use.
     pv = None
+    pv_failed = False
     try:
         pv = await fetch_pv_forecast(target_date, settings=settings)
     except OpenMeteoAPIError as exc:
-        log.warning("main.pv_forecast_failed_planning_blind", error=str(exc))
+        pv_failed = True
+        log.warning(
+            "main.pv_forecast_failed_skipping_cycles",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            cause_type=type(exc.__cause__).__name__ if exc.__cause__ else None,
+            cause_repr=repr(exc.__cause__) if exc.__cause__ else None,
+        )
 
     # Prices are not optional — without them there is nothing to plan.
     try:
@@ -122,7 +131,13 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         return 1
 
     hourly = aggregate_hourly(periods)
-    plan = plan_day(hourly, target_date, settings=settings, pv_forecast=pv)
+    plan = plan_day(
+        hourly,
+        target_date,
+        settings=settings,
+        pv_forecast=pv,
+        pv_forecast_failed=pv_failed,
+    )
     log.info(
         "main.plan_ready",
         cycles=len(plan.cycles),

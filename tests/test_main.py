@@ -74,10 +74,21 @@ async def test_run_survives_pv_forecast_failure(
     seen: dict = {}
     real_plan_day = main_mod.plan_day
 
-    def spy_plan_day(hourly, target_date, settings=None, pv_forecast=None):
+    def spy_plan_day(
+        hourly,
+        target_date,
+        settings=None,
+        pv_forecast=None,
+        pv_forecast_failed=False,
+    ):
         seen["pv_forecast"] = pv_forecast
+        seen["pv_forecast_failed"] = pv_forecast_failed
         return real_plan_day(
-            hourly, target_date, settings=settings, pv_forecast=pv_forecast
+            hourly,
+            target_date,
+            settings=settings,
+            pv_forecast=pv_forecast,
+            pv_forecast_failed=pv_forecast_failed,
         )
 
     monkeypatch.setattr(main_mod, "fetch_pv_forecast", boom)
@@ -87,7 +98,11 @@ async def test_run_survives_pv_forecast_failure(
     rc = await main_mod._run(args, settings)
 
     assert rc == 0, "a PV failure must not fail the run"
-    assert seen["pv_forecast"] is None, "planning must proceed PV-blind"
+    assert seen["pv_forecast"] is None
+    assert seen["pv_forecast_failed"] is True, (
+        "the planner must be told PV is unavailable so it suppresses cycles "
+        "rather than paying for grid energy the sun would have supplied"
+    )
     assert stub_ntfy.sent, "the plan summary must still be sent"
 
 

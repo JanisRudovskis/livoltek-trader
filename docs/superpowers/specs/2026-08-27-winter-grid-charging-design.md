@@ -1,8 +1,8 @@
 # Winter grid-charging: honest cycle valuation and drain-anchored charge placement
 
 **Date:** 2026-08-27
-**Status:** Part 1 implemented and green (87 tests). November re-measurement outstanding — see §5.3
-**Revision:** rev4 — Part 1 implemented; economics backtested. See §9 for the trail.
+**Status:** Part 1 implemented and deployed; 89 tests green. November re-measurement outstanding — see §5.3
+**Revision:** rev5 — deployed; three production bugs found and fixed. See §9 for the trail.
 **Scope:** `strategy.py`, `config.py`, `tests/test_strategy.py`. Telemetry turned
 out to need no new production code at all (§5).
 
@@ -570,13 +570,33 @@ Must continue to pass unchanged: PV-skip gate tests, all `_plan_stop_window` /
 sunny-day tests, `aggregate_hourly` tests, and the `max_cycles_per_day == 0`
 short-circuit.
 
-### 7.1 Unrelated one-line resilience win
+### 7.1 PV-fetch resilience — and why "plan blind" was the wrong fix
 
-`main.py` lines 94–101 abort the whole run if Open-Meteo fails, even though
-`plan_day` accepts `pv_forecast=None` and a deep-winter plan barely needs PV. Let
-a PV fetch failure degrade to `None` instead of killing the night's schedule.
-Independently shippable, and it removes a single-point failure for exactly the
-season this spec addresses.
+`main.py` used to abort the whole run if Open-Meteo failed. The first fix let a
+PV failure degrade to `pv_forecast=None` and plan anyway. **That was wrong, and
+it cost money on its first outing.**
+
+On the 2026-09-02 run Open-Meteo timed out, the planner ran PV-blind, and
+because the PV-skip gate never fired it scheduled a €0.37 cycle. That day went
+on to produce 28.1 kWh of PV — the battery would have filled for free. Buying a
+full charge to displace nothing costs roughly €1.08 (11.63 kWh at a night price
+plus a €0.50 wear cycle).
+
+The asymmetry decides it:
+
+| PV unknown, and we… | Cost |
+|---|---|
+| plan anyway | ~€1.08 wasted whenever the sun would have filled the battery |
+| skip cycles | ~€0.12 expected (one winter cycle's €0.43 profit, on 29 % of days) |
+
+So `plan_day` now takes `pv_forecast_failed: bool`. It is deliberately distinct
+from `pv_forecast=None`, which still means "no PV constraint requested" and
+plans normally — manual runs and tests rely on that. When the flag is set the
+plan is empty, ToU is switched off, and the inverter falls back to plain
+Self-use, which is the correct do-nothing default.
+
+The run still completes and still notifies, which was the point of the original
+change.
 
 ---
 
@@ -594,6 +614,30 @@ season this spec addresses.
 ---
 
 ## 9. Revision history
+
+**rev5 (2026-09-02)** — first production runs; three bugs found, none in the
+planner logic itself.
+
+- **Stale Railway env vars pinned the old constants.** `.env.example` shipped
+  `BATTERY_CAPACITY_KWH=10.24` / `ROUND_TRIP_EFFICIENCY=0.90` as nameplate
+  guesses; those were in the deployment environment and pydantic-settings gives
+  env vars priority. Production ran the new algorithm on the old optimistic
+  numbers. Fixed by removing them from `.env.example` and logging the effective
+  constants in `main.start` (`d65663a`).
+- **Device-card selector broke.** The portal inlined Device List images as
+  base64 data URIs, so `img[src*="hp3_online"]` stopped matching and every run
+  died on a 30 s timeout before writing a schedule. Re-anchored on the model
+  text (`8a7c6f0`).
+- **Slot rows are gated by strategy.** A row's time/Power/SOC inputs stay
+  `disabled` until that row has a real Strategy, but the code filled times
+  first. Since `_clear_slot` writes "Without a strategy", the bug was
+  self-inflicting: any later plan needing two or more slots timed out
+  (`f892aea`).
+- **"Plan blind on PV failure" was the wrong resilience fix** and cost money on
+  its first outing. Replaced with `pv_forecast_failed`, which suppresses cycles
+  (§7.1).
+- Also found: `.env.example` documented a `DRY_RUN` variable that does not
+  exist, implying portal writes could be disabled by environment (`c4aa069`).
 
 **rev4 (2026-08-27)** — Part 1 implemented; spec corrected by backtest.
 

@@ -297,6 +297,7 @@ def plan_day(
     target_date: date,
     settings: Settings | None = None,
     pv_forecast: PvForecast | None = None,
+    pv_forecast_failed: bool = False,
 ) -> DailyPlan:
     """Pick the best footprint-disjoint set of grid-charge cycles for the day.
 
@@ -335,6 +336,26 @@ def plan_day(
             target_date=target_date,
             cycles=[],
             skipped_reason="max_cycles_per_day is 0",
+            total_net_profit_eur=0.0,
+            stop_window=None,
+        )
+
+    # `pv_forecast_failed` is NOT the same as `pv_forecast is None`. None means
+    # "no PV constraint requested" (manual runs, tests) and still plans. This
+    # flag means we asked and could not find out, and then the safe answer is
+    # to do nothing: buying a full charge that the sun would have supplied for
+    # free costs ~EUR 1.08, while skipping costs at most one winter cycle's
+    # profit (~EUR 0.43, on 29% of winter days). Roughly 9x asymmetric, so we
+    # fall back to plain Self-use. See the 2026-09-02 run, which planned blind
+    # through an Open-Meteo timeout on a day that yielded 28 kWh of PV.
+    if pv_forecast_failed:
+        return DailyPlan(
+            target_date=target_date,
+            cycles=[],
+            skipped_reason=(
+                "PV forecast unavailable — skipping rather than buying grid "
+                "energy the sun might have supplied"
+            ),
             total_net_profit_eur=0.0,
             stop_window=None,
         )

@@ -341,6 +341,37 @@ def test_plan_day_without_pv_forecast_behaves_as_before(settings):
     assert plan.cycles, "with no forecast, fall back to grid-only logic"
 
 
+def test_plan_day_skips_cycles_when_the_pv_forecast_could_not_be_fetched(settings):
+    """A failed PV fetch must suppress cycles, not plan blind.
+
+    Planning blind is not neutral: on 2026-09-02 the Open-Meteo call timed out,
+    the planner charged from the grid, and the day went on to produce 28 kWh of
+    PV that would have filled the battery for free. Buying ~11.6 kWh plus a
+    wear cycle to displace nothing costs about EUR 1.08. Skipping instead costs
+    at most one winter cycle's profit (~EUR 0.43, on 29% of winter days), so
+    skipping wins by roughly 9x in expectation.
+
+    Note this is DIFFERENT from `pv_forecast=None`, which means "no PV
+    constraint requested" and still plans.
+    """
+    hourly = _strong_spread_hourly(9)
+
+    blind = plan_day(hourly, date(2026, 5, 9), settings, pv_forecast=None)
+    assert blind.cycles, "sanity: these prices are otherwise tradeable"
+
+    plan = plan_day(
+        hourly,
+        date(2026, 5, 9),
+        settings,
+        pv_forecast=None,
+        pv_forecast_failed=True,
+    )
+    assert plan.cycles == []
+    assert plan.stop_window is None
+    assert plan.is_empty, "empty plan disables ToU and leaves Self-use running"
+    assert plan.skipped_reason and "PV forecast unavailable" in plan.skipped_reason
+
+
 # --- max-six-cycle cap ------------------------------------------------------
 
 
