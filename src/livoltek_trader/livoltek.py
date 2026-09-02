@@ -259,7 +259,7 @@ class LivoltekClient:
         )
         log.info("livoltek.nav.station_reached")
 
-        await page.locator('img[src*="hp3_online"]').first.click()
+        await self._open_device_card()
         await page.wait_for_url(
             f"**{self.DEVICE_URL_FRAGMENT}**", timeout=15000
         )
@@ -272,6 +272,53 @@ class LivoltekClient:
         await page.get_by_role("button", name="Read Params.").first.click()
         await asyncio.sleep(2.0)
         log.info("livoltek.nav.read_params_clicked")
+
+    async def _open_device_card(self) -> None:
+        """Click the inverter's card in the station page's Device List.
+
+        Anchored on the MODEL TEXT, not on the card image. The Device List
+        renders one row per device, each an unclassed `<div>` holding exactly
+        one card image plus an `el-descriptions` block whose title reads
+        `<serial>(<model>)`. So: from the label, walk to the nearest ancestor
+        div that contains an image, and click that image.
+
+        Why not the image directly: the previous selector was
+        `img[src*="hp3_online"]`, which encoded both the portal's asset
+        filename and the device's online state. On 2026-09-02 the portal
+        inlined those images as base64 data URIs; the selector stopped
+        matching and every run died on a 30 s timeout before writing a
+        schedule. Matching on the model survives both an asset rename and the
+        device going offline.
+        """
+        page = self.page
+        model = self._settings.livoltek_device_model
+        if '"' in model:
+            raise LivoltekError(
+                f"device model must not contain a double quote: {model!r}"
+            )
+
+        card_image = page.locator(
+            f'xpath=//*[contains(text(),"{model}")]'
+            f"/ancestor::div[.//img][1]//img"
+        ).first
+        try:
+            await card_image.click()
+        except PlaywrightTimeoutError as exc:
+            # Name what we looked for and what the page actually offers, so the
+            # next portal change is one log line to diagnose instead of a bare
+            # Playwright timeout.
+            labels = await page.evaluate(
+                """() => Array.from(document.querySelectorAll('.el-descriptions__title'))
+                    .map(e => (e.textContent || '').trim())
+                    .filter(Boolean)"""
+            )
+            raise LivoltekError(
+                f"device card for model {model!r} not found on the station "
+                f"page. Device List shows: {labels}. If the model is right, "
+                f"the portal's Device List markup changed — run "
+                f"scripts/livoltek_peek_device_dom.py to re-derive the anchor."
+            ) from exc
+        log.info("livoltek.nav.device_card_clicked", model=model)
 
     async def apply_schedule(self, plan: DailyPlan, *, save: bool = False) -> None:
         """Write the day's plan to the System mode form.

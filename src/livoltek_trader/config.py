@@ -140,6 +140,19 @@ class Settings(BaseSettings):
     livoltek_portal_url: str = Field(default="https://evs.livoltek-portal.com/#/")
     livoltek_username: str = Field(default="")
     livoltek_password: str = Field(default="")
+    livoltek_device_model: str = Field(default="HP3-10KD2")
+    """Inverter model as printed on the station page's Device List card.
+
+    The card label reads `<serial>(<model>)`, e.g. `HP310K2HAC130295(HP3-10KD2)`.
+    We locate the device by this text rather than by its card image.
+
+    History: the nav used to click `img[src*="hp3_online"]`. That selector
+    encoded two things it should not have — the portal's image asset name and
+    the device's online/offline state. On 2026-09-02 the portal switched device
+    card images from `./static/img/hp3_online.*.png` to inlined base64 data
+    URIs, the selector stopped matching, and every run died with a 30 s
+    Playwright timeout before writing any schedule.
+    """
     livoltek_storage_state_path: str = Field(default="browser-data/storage_state.json")
     livoltek_browser_timeout_s: float = Field(default=30.0, gt=0.0)
     livoltek_headless: bool = Field(default=False)
