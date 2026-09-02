@@ -410,13 +410,14 @@ class LivoltekClient:
     async def _fill_charge_slot(
         self, slot_idx: int, cycle: CyclePair, weekday: str
     ) -> None:
-        page = self.page
         start_str = cycle.charge.start.astimezone(RIGA_TZ).strftime("%H:%M")
         end_str = cycle.charge.end.astimezone(RIGA_TZ).strftime("%H:%M")
 
+        # Strategy MUST be set first — see _await_row_editable.
+        await self._select_strategy(slot_idx, "Charge")
+        await self._await_row_editable(slot_idx)
         await self._fill_time_field("Start Time", slot_idx, start_str)
         await self._fill_time_field("End Time", slot_idx, end_str)
-        await self._select_strategy(slot_idx, "Charge")
         await self._set_slot_weekday(slot_idx, weekday)
         await self._fill_number_field("Power", slot_idx, "10.00")
         await self._fill_number_field("SOC", slot_idx, "100")
@@ -447,9 +448,11 @@ class LivoltekClient:
         end_str = window.end.astimezone(RIGA_TZ).strftime("%H:%M")
         soc_target = str(self._settings.morning_discharge_target_soc_pct)
 
+        # Strategy MUST be set first — see _await_row_editable.
+        await self._select_strategy(slot_idx, "Discharge")
+        await self._await_row_editable(slot_idx)
         await self._fill_time_field("Start Time", slot_idx, start_str)
         await self._fill_time_field("End Time", slot_idx, end_str)
-        await self._select_strategy(slot_idx, "Discharge")
         await self._set_slot_weekday(slot_idx, weekday)
         await self._fill_number_field("Power", slot_idx, "10.00")
         await self._fill_number_field("SOC", slot_idx, soc_target)
@@ -465,6 +468,43 @@ class LivoltekClient:
     async def _clear_slot(self, slot_idx: int) -> None:
         await self._select_strategy(slot_idx, "Without a strategy")
         log.info("livoltek.slot.cleared", slot=slot_idx)
+
+    async def _await_row_editable(
+        self, slot_idx: int, timeout_ms: int = 5000
+    ) -> None:
+        """Wait for a slot row's inputs to become editable after its strategy.
+
+        The portal gates each row: `Start Time`, `End Time`, `Power` and `SOC`
+        carry `disabled` until that row's Strategy is something other than
+        `Without a strategy`. The Strategy dropdowns themselves are never
+        disabled.
+
+        This is why strategy is selected FIRST. The original order filled the
+        times before the strategy, which only worked while a row happened to
+        retain a real strategy from an earlier run. `_clear_slot` sets unused
+        rows to `Without a strategy`, so once a plan had cleared rows 1-5, every
+        later multi-slot plan (or any sunny plan writing Discharge in slot 0 and
+        a Charge cycle in slot 1) silently hit a 30 s timeout on a disabled
+        input.
+        """
+        field = self.page.locator('input[placeholder="Start Time"]').nth(slot_idx)
+        try:
+            await field.wait_for(state="visible", timeout=timeout_ms)
+            await self.page.wait_for_function(
+                """([idx]) => {
+                    const els = document.querySelectorAll(
+                        'input[placeholder="Start Time"]');
+                    return els[idx] && !els[idx].disabled;
+                }""",
+                arg=[slot_idx],
+                timeout=timeout_ms,
+            )
+        except PlaywrightTimeoutError as exc:
+            raise LivoltekError(
+                f"slot {slot_idx} stayed disabled after selecting its "
+                f"strategy — the portal's row-gating rule changed. Run "
+                f"scripts/livoltek_peek_slot_gating.py to re-derive it."
+            ) from exc
 
     async def _fill_time_field(
         self, placeholder: str, slot_idx: int, value: str
