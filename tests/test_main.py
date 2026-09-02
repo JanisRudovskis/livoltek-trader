@@ -91,6 +91,42 @@ async def test_run_survives_pv_forecast_failure(
     assert stub_ntfy.sent, "the plan summary must still be sent"
 
 
+async def test_run_logs_the_effective_hardware_constants(
+    monkeypatch, args, settings, stub_ntfy
+):
+    """Every run must print the constants that actually took effect.
+
+    These are measured values living as defaults in config.py, but any of them
+    can be silently overridden by a stale environment variable on the host —
+    which is exactly what happened on 2026-09-01, when Railway still carried
+    BATTERY_CAPACITY_KWH=10.24 from the old .env.example and pinned the
+    planner to numbers that overstate every cycle. Logging them makes that
+    drift visible in the first line of the run instead of invisible.
+    """
+    import structlog
+
+    async def pv(*_a, **_kw):
+        raise OpenMeteoAPIError("skip pv")
+
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", pv)
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+
+    with structlog.testing.capture_logs() as logs:
+        await main_mod._run(args, settings)
+
+    start = next(e for e in logs if e["event"] == "main.start")
+    assert start["cycle_output_kwh"] == pytest.approx(
+        settings.cycle_output_kwh, abs=0.01
+    )
+    assert start["battery_capacity_kwh"] == pytest.approx(
+        settings.battery_capacity_kwh, abs=0.01
+    )
+    assert start["battery_drain_hours"] == settings.battery_drain_hours
+
+
 async def test_run_aborts_when_price_fetch_fails(
     monkeypatch, args, settings, stub_ntfy
 ):

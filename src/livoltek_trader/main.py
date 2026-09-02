@@ -83,10 +83,21 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
     target_date = (
         date.fromisoformat(args.date) if args.date else _default_target_date()
     )
+    # Log the hardware constants that actually took effect. They are measured
+    # values living as defaults in config.py, but pydantic-settings lets any
+    # of them be overridden by an environment variable on the host. A stale
+    # override silently changes what the planner considers profitable — on
+    # 2026-09-01 Railway still carried BATTERY_CAPACITY_KWH=10.24 from an old
+    # .env.example, pinning the planner to pre-measurement numbers. Printing
+    # them makes that drift obvious in the first line of every run.
     log.info(
         "main.start",
         target_date=target_date.isoformat(),
         execute=bool(args.execute),
+        battery_capacity_kwh=settings.battery_capacity_kwh,
+        cycle_output_kwh=round(settings.cycle_output_kwh, 3),
+        battery_drain_hours=settings.battery_drain_hours,
+        min_net_profit_eur=settings.min_net_profit_per_cycle_eur,
     )
 
     ntfy = NtfyClient(settings)
