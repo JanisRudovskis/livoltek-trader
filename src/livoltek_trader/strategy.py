@@ -298,6 +298,7 @@ def plan_day(
     settings: Settings | None = None,
     pv_forecast: PvForecast | None = None,
     pv_forecast_failed: bool = False,
+    measured_daily_load_kwh: float | None = None,
 ) -> DailyPlan:
     """Pick the best footprint-disjoint set of grid-charge cycles for the day.
 
@@ -370,13 +371,24 @@ def plan_day(
     chosen: list[CyclePair] = []
     used_hours: set[datetime] = set()
 
+    # Prefer measured recent load over the configured constant. The constant
+    # cannot be right in both seasons — measured load is ~17 kWh/day in
+    # September and 30–60 in winter — and a stale value makes this gate skip
+    # cycles on exactly the cold days that pay best.
+    daily_load_kwh = (
+        measured_daily_load_kwh
+        if measured_daily_load_kwh is not None and measured_daily_load_kwh > 0
+        else settings.expected_daily_load_kwh
+    )
+
     if pv_forecast is not None:
         expected_grid_imports = max(
-            0.0, settings.expected_daily_load_kwh - pv_forecast.expected_kwh
+            0.0, daily_load_kwh - pv_forecast.expected_kwh
         )
         if expected_grid_imports < settings.cycle_output_kwh:
             cycle_skip_reason = (
-                f"PV forecast {pv_forecast.expected_kwh:.1f} kWh leaves only "
+                f"PV forecast {pv_forecast.expected_kwh:.1f} kWh vs load "
+                f"{daily_load_kwh:.1f} kWh leaves only "
                 f"{expected_grid_imports:.1f} kWh grid imports — below one "
                 f"cycle output ({settings.cycle_output_kwh:.1f} kWh)"
             )
@@ -450,6 +462,14 @@ def plan_day(
     # Morning Discharge window: only on sunny days where PV clearly exceeds
     # load by the configured safety margin. Below this gate we trust Self-use
     # to manage the battery without explicitly draining it in the morning.
+    #
+    # NOTE the deliberate asymmetry: the import gate above uses measured load,
+    # this one still uses the configured constant. Feeding measured load in
+    # here would LOWER the bar in summer (17 × 1.5 = 25.5 instead of 33), so
+    # the inverter would sell the battery to grid on more mornings. That is the
+    # opposite of what a user complaining about an empty battery wants, and it
+    # is a bigger behaviour change than the one being made. Revisit only with
+    # winter data showing the sunny branch is too conservative.
     stop_window: TradingWindow | None = None
     if (
         pv_forecast is not None

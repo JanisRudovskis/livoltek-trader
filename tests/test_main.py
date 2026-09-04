@@ -11,6 +11,7 @@ from livoltek_trader import main as main_mod
 from livoltek_trader.config import Settings
 from livoltek_trader.elering import ElerinAPIError, PricePeriod
 from livoltek_trader.solar import OpenMeteoAPIError, PvForecast
+from livoltek_trader.telemetry import DailyTotals
 
 UTC = timezone.utc
 
@@ -55,6 +56,42 @@ def stub_ntfy(monkeypatch) -> _StubNtfy:
     return stub
 
 
+class _StubPortal:
+    """Stands in for LivoltekClient so no unit test can reach the portal.
+
+    `_run` now opens a read-only portal session to fetch measured load. Without
+    this fixture these tests launched a real browser and logged into the live
+    portal — 36 s per suite run and a genuine side effect from a unit test.
+    """
+
+    def __init__(self, totals=None, fail: bool = False) -> None:
+        self.totals = totals if totals is not None else []
+        self.fail = fail
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        return None
+
+    async def login(self) -> None:
+        if self.fail:
+            raise RuntimeError("portal unreachable")
+
+    async def read_daily_totals(self, start, end):
+        if self.fail:
+            raise RuntimeError("portal unreachable")
+        return list(self.totals)
+
+
+@pytest.fixture(autouse=True)
+def no_real_portal(monkeypatch) -> _StubPortal:
+    """Applied to every test in this module: never touch the real portal."""
+    stub = _StubPortal()
+    monkeypatch.setattr(main_mod, "LivoltekClient", lambda *a, **kw: stub)
+    return stub
+
+
 async def test_run_survives_pv_forecast_failure(
     monkeypatch, args, settings, stub_ntfy
 ):
@@ -74,22 +111,9 @@ async def test_run_survives_pv_forecast_failure(
     seen: dict = {}
     real_plan_day = main_mod.plan_day
 
-    def spy_plan_day(
-        hourly,
-        target_date,
-        settings=None,
-        pv_forecast=None,
-        pv_forecast_failed=False,
-    ):
-        seen["pv_forecast"] = pv_forecast
-        seen["pv_forecast_failed"] = pv_forecast_failed
-        return real_plan_day(
-            hourly,
-            target_date,
-            settings=settings,
-            pv_forecast=pv_forecast,
-            pv_forecast_failed=pv_forecast_failed,
-        )
+    def spy_plan_day(hourly, target_date, settings=None, **kwargs):
+        seen.update(kwargs)
+        return real_plan_day(hourly, target_date, settings=settings, **kwargs)
 
     monkeypatch.setattr(main_mod, "fetch_pv_forecast", boom)
     monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
@@ -140,6 +164,100 @@ async def test_run_logs_the_effective_hardware_constants(
         settings.battery_capacity_kwh, abs=0.01
     )
     assert start["battery_drain_hours"] == settings.battery_drain_hours
+
+
+def _totals(day: str, load: float, imp: float) -> DailyTotals:
+    return DailyTotals(
+        day=date.fromisoformat(day),
+        pv_yield_kwh=10.0,
+        grid_import_kwh=imp,
+        grid_export_kwh=0.0,
+        battery_charged_kwh=5.0,
+        battery_discharged_kwh=load - 10.0 + imp + 5.0,
+        load_kwh=load,
+    )
+
+
+async def test_run_passes_measured_load_to_the_planner(
+    monkeypatch, args, settings, stub_ntfy, no_real_portal
+):
+    """Measured load must reach the PV gate, and the actuals must reach ntfy."""
+
+    async def pv(*_a, **_kw):
+        return PvForecast(
+            target_date=date(2026, 12, 15),
+            expected_kwh=2.0,
+            shortwave_radiation_mj_m2=0.7,
+            sunshine_hours=1.0,
+            cloud_cover_pct=90.0,
+        )
+
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    no_real_portal.totals = [
+        _totals("2026-12-12", 38.0, 20.0),
+        _totals("2026-12-13", 42.0, 24.0),
+        _totals("2026-12-14", 40.0, 22.0),
+    ]
+    seen: dict = {}
+    real_plan_day = main_mod.plan_day
+
+    def spy(hourly, target_date, settings=None, **kwargs):
+        seen.update(kwargs)
+        return real_plan_day(hourly, target_date, settings=settings, **kwargs)
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", pv)
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    monkeypatch.setattr(main_mod, "plan_day", spy)
+
+    rc = await main_mod._run(args, settings)
+
+    assert rc == 0
+    assert seen["measured_daily_load_kwh"] == pytest.approx(40.0)
+    # The configured constant is 22.0; a winter house pulling 40 must not be
+    # planned against 22, or the gate under-states what there is to displace.
+    assert seen["measured_daily_load_kwh"] > settings.expected_daily_load_kwh
+    body = stub_ntfy.sent[0][1]
+    assert "22.0" in body, "the latest day's grid import belongs in the message"
+
+
+async def test_run_degrades_when_the_portal_read_fails(
+    monkeypatch, args, settings, stub_ntfy, no_real_portal
+):
+    """A portal read failure must cost nothing but the measured load."""
+
+    async def pv(*_a, **_kw):
+        return PvForecast(
+            target_date=date(2026, 12, 15),
+            expected_kwh=2.0,
+            shortwave_radiation_mj_m2=0.7,
+            sunshine_hours=1.0,
+            cloud_cover_pct=90.0,
+        )
+
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    no_real_portal.fail = True
+    seen: dict = {}
+    real_plan_day = main_mod.plan_day
+
+    def spy(hourly, target_date, settings=None, **kwargs):
+        seen.update(kwargs)
+        return real_plan_day(hourly, target_date, settings=settings, **kwargs)
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", pv)
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    monkeypatch.setattr(main_mod, "plan_day", spy)
+
+    rc = await main_mod._run(args, settings)
+
+    assert rc == 0, "a read failure must not fail the run"
+    assert seen["measured_daily_load_kwh"] is None
+    assert stub_ntfy.sent, "the plan must still be notified"
+    assert "Vakar" not in stub_ntfy.sent[0][1]
+    assert "Šodien" not in stub_ntfy.sent[0][1]
 
 
 async def test_run_aborts_when_price_fetch_fails(

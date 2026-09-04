@@ -12,7 +12,10 @@ and write the daily schedule (toggle ToU + fill 1-6 Charge slots, then Save).
 from __future__ import annotations
 
 import asyncio
+import calendar
+import json
 from contextlib import AsyncExitStack
+from datetime import date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -28,6 +31,7 @@ from playwright.async_api import (
 
 from livoltek_trader.config import Settings, get_settings
 from livoltek_trader.strategy import CyclePair, DailyPlan, TradingWindow
+from livoltek_trader.telemetry import DailyTotals, parse_daily_rows
 
 RIGA_TZ = ZoneInfo("Europe/Riga")
 
@@ -286,6 +290,102 @@ class LivoltekClient:
             f"**{self.DEVICE_URL_FRAGMENT}**", timeout=15000
         )
         log.info("livoltek.nav.device_reached")
+
+    DAILY_REPORT_PATH = "/ctrller-manager/powerstation/reportForm"
+
+    async def read_daily_totals(
+        self, start: date, end: date
+    ) -> list[DailyTotals]:
+        """Read the portal's daily energy table for [start, end]. Read-only.
+
+        Walks to the device page and opens `Data report`, which is what makes
+        the SPA fire the request we need — not for its response, but to capture
+        its `authorization` header. Cookies alone are not enough: replaying the
+        endpoint without that header returns an all-null shape that looks
+        exactly like "no data retained".
+
+        Never touches `Params set`, so this cannot write to the inverter.
+        """
+        page = self.page
+        captured: dict = {}
+
+        def on_request(request) -> None:
+            if self.DAILY_REPORT_PATH not in request.url:
+                return
+            if "headers" in captured:
+                return
+            captured["headers"] = {
+                k: v
+                for k, v in (request.headers or {}).items()
+                if k.lower() not in ("host", "content-length", "connection")
+            }
+            try:
+                captured["station_id"] = json.loads(
+                    request.post_data or "{}"
+                ).get("id")
+            except (ValueError, TypeError):
+                pass
+
+        page.on("request", on_request)
+        try:
+            await self.navigate_to_device()
+            await page.get_by_role("tab", name="Data report", exact=True).click(
+                timeout=15000
+            )
+            # The tab fires its requests asynchronously after the click.
+            for _ in range(20):
+                if "headers" in captured:
+                    break
+                await asyncio.sleep(0.5)
+        except PlaywrightTimeoutError as exc:
+            raise LivoltekError(
+                "could not open the 'Data report' tab to read daily totals"
+            ) from exc
+        finally:
+            page.remove_listener("request", on_request)
+
+        if "headers" not in captured or captured.get("station_id") is None:
+            raise LivoltekError(
+                "did not observe a daily-report request, so could not capture "
+                "the authorization header the endpoint requires"
+            )
+
+        rows: list = []
+        # One request per calendar month — that is the granularity the endpoint
+        # takes (timeType 1).
+        month = date(start.year, start.month, 1)
+        while month <= end:
+            last = calendar.monthrange(month.year, month.month)[1]
+            response = await page.request.post(
+                f"https://{self.EU_HOST}{self.DAILY_REPORT_PATH}",
+                headers=captured["headers"],
+                data={
+                    "id": captured["station_id"],
+                    "timeType": 1,
+                    "startTime": f"{month.isoformat()} 00:00:00",
+                    "endTime": (
+                        f"{month.year:04d}-{month.month:02d}-{last:02d} 23:59:59"
+                    ),
+                },
+                timeout=30000,
+            )
+            payload = json.loads(await response.text())
+            rows.extend((payload or {}).get("data") or [])
+            month = date(
+                month.year + (month.month == 12), (month.month % 12) + 1, 1
+            )
+
+        totals = [t for t in parse_daily_rows(rows) if start <= t.day <= end]
+        unbalanced = [t.day.isoformat() for t in totals if not t.balances]
+        if unbalanced:
+            # PV + import + discharge should equal load + export + charge. If it
+            # stops holding, the portal's column mapping has changed and every
+            # number derived from it is suspect.
+            log.warning(
+                "livoltek.daily_totals.energy_balance_off", days=unbalanced[:5]
+            )
+        log.info("livoltek.daily_totals.read", days=len(totals))
+        return totals
 
     async def navigate_to_system_mode(self) -> None:
         """Walk to Params set → System mode and read the inverter's params.

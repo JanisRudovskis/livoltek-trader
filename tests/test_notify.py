@@ -155,6 +155,50 @@ def test_format_plan_message_empty_plan_says_tou_off():
     assert "sunny" in tags
 
 
+def test_format_plan_message_includes_yesterdays_grid_import():
+    """The notification must carry the number that answers "is this working?".
+
+    Before this, the message listed slots and the PV forecast — everything
+    about the PLAN and nothing about the OUTCOME. The user was left judging the
+    system by battery SOC in the app, which is misleading, and reasonably
+    concluded it was broken on a day it had imported 0.6 kWh.
+    """
+    from livoltek_trader.telemetry import DailyTotals
+
+    plan = DailyPlan(
+        target_date=date(2026, 5, 10),
+        cycles=[],
+        skipped_reason="PV covers the day",
+        total_net_profit_eur=0.0,
+    )
+    yesterday = DailyTotals(
+        day=date(2026, 5, 9),
+        pv_yield_kwh=10.1,
+        grid_import_kwh=0.6,
+        grid_export_kwh=0.0,
+        battery_charged_kwh=6.0,
+        battery_discharged_kwh=9.3,
+        load_kwh=14.0,
+    )
+    _, body, _ = format_plan_message(
+        plan, pv_forecast=_pv_forecast(30.0), yesterday=yesterday
+    )
+    assert "0.6" in body, "yesterday's grid import must be in the body"
+    assert "14.0" in body
+    assert "10.1" in body
+
+
+def test_format_plan_message_without_yesterday_is_unchanged():
+    plan = DailyPlan(
+        target_date=date(2026, 5, 10),
+        cycles=[],
+        skipped_reason="PV covers the day",
+        total_net_profit_eur=0.0,
+    )
+    _, body, _ = format_plan_message(plan, pv_forecast=_pv_forecast(30.0))
+    assert "Vakar" not in body
+
+
 def test_format_plan_message_single_cycle_listed_with_riga_times():
     # UTC 11:00 -> Riga 14:00 (EEST in May)
     plan = DailyPlan(

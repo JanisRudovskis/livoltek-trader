@@ -335,6 +335,55 @@ def test_plan_day_skips_when_gap_below_one_cycle(settings):
     assert plan.skipped_reason and "below one cycle output" in plan.skipped_reason
 
 
+def test_pv_gate_prefers_measured_load_over_the_configured_constant(settings):
+    """The gate must use real recent load, not a hard-coded annual guess.
+
+    `expected_daily_load_kwh` cannot be right in both seasons: measured load is
+    ~17 kWh/day in September and 30-60 in winter. With the constant at 22 the
+    gate under-states winter grid imports and skips cycles on exactly the cold
+    days that pay best.
+
+    Here PV is 18 kWh and one cycle delivers 5 kWh. Against the constant 22 the
+    gap is 4 kWh and cycles are skipped; against a measured 30 kWh the gap is
+    12 kWh and they are planned.
+    """
+    settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
+    hourly = _strong_spread_hourly(9)
+    pv = _pv(date(2026, 5, 9), kwh=18.0)
+
+    on_constant = plan_day(hourly, date(2026, 5, 9), settings, pv_forecast=pv)
+    assert on_constant.cycles == []
+    assert on_constant.skipped_reason and "below one cycle output" in (
+        on_constant.skipped_reason
+    )
+
+    on_measured = plan_day(
+        hourly,
+        date(2026, 5, 9),
+        settings,
+        pv_forecast=pv,
+        measured_daily_load_kwh=30.0,
+    )
+    assert on_measured.cycles, "a real 30 kWh load leaves plenty to displace"
+
+
+def test_pv_gate_falls_back_to_the_constant_when_load_is_unmeasured(settings):
+    """A failed portal read must not change planning behaviour."""
+    settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
+    hourly = _strong_spread_hourly(9)
+    pv = _pv(date(2026, 5, 9), kwh=8.0)
+
+    with_none = plan_day(
+        hourly,
+        date(2026, 5, 9),
+        settings,
+        pv_forecast=pv,
+        measured_daily_load_kwh=None,
+    )
+    without = plan_day(hourly, date(2026, 5, 9), settings, pv_forecast=pv)
+    assert len(with_none.cycles) == len(without.cycles)
+
+
 def test_plan_day_without_pv_forecast_behaves_as_before(settings):
     hourly = _strong_spread_hourly(9)
     plan = plan_day(hourly, date(2026, 5, 9), settings, pv_forecast=None)

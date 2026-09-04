@@ -8,6 +8,7 @@ docstrings stay English.
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
@@ -16,8 +17,13 @@ import httpx
 from livoltek_trader.config import Settings, get_settings
 from livoltek_trader.solar import PvForecast
 from livoltek_trader.strategy import DailyPlan, HourlyPrice
+from livoltek_trader.telemetry import DailyTotals, format_daily_totals_line
 
 RIGA_TZ = ZoneInfo("Europe/Riga")
+
+# The cron plans TOMORROW, so the day it runs on is target_date - 1. That is
+# the reference the actuals line labels itself against.
+_ONE_DAY = timedelta(days=1)
 
 
 class NtfyError(RuntimeError):
@@ -97,13 +103,22 @@ def format_plan_message(
     pv_forecast: PvForecast | None = None,
     hourly_prices: list[HourlyPrice] | None = None,
     settings: Settings | None = None,
+    yesterday: DailyTotals | None = None,
 ) -> tuple[str, str, list[str]]:
     """Render a daily plan as (title, body, tags) — minimal slot listing.
 
-    Body shows only the PV forecast and a flat list of scheduled slots
-    (start–end + strategy, Riga local time). Skip days show "ToU
-    izslēgts". `hourly_prices` and `settings` are accepted for backward
-    compatibility but no longer used.
+    Body shows the PV forecast, a flat list of scheduled slots (start–end +
+    strategy, Riga local time), and — when available — one line of
+    YESTERDAY'S ACTUALS. Skip days show "ToU izslēgts".
+
+    The actuals line exists because the message used to describe only the plan
+    and never the outcome. That left battery SOC in the app as the only
+    feedback, and SOC is misleading on its own: 30 % against a 0.4 kW load is
+    fine, 30 % against a heat pump is not. Grid import in kWh is unambiguous,
+    so it goes in every notification.
+
+    `hourly_prices` and `settings` are accepted for backward compatibility;
+    only `settings` is still read (for the morning-discharge SOC target).
     """
     has_stop = plan.stop_window is not None
     has_cycles = bool(plan.cycles)
@@ -150,6 +165,15 @@ def format_plan_message(
             lines.append(
                 f"{_fmt_local(c.charge.start)}-{_fmt_local(c.charge.end)} Charge 100%"
             )
+
+    if yesterday is not None:
+        lines.append("")
+        # No EUR figure: an honest cost needs hourly import weighted by hourly
+        # price, and multiplying by a daily mean would understate it (imports
+        # cluster at the peaks). kWh alone is unambiguous.
+        lines.append(
+            format_daily_totals_line(yesterday, today=plan.target_date - _ONE_DAY)
+        )
 
     return title, "\n".join(lines), tags
 

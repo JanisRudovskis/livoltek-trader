@@ -36,8 +36,18 @@ from livoltek_trader.notify import (
 )
 from livoltek_trader.solar import OpenMeteoAPIError, fetch_pv_forecast
 from livoltek_trader.strategy import aggregate_hourly, plan_day
+from livoltek_trader.telemetry import DailyTotals, trailing_mean_load_kwh
 
 log = structlog.get_logger(__name__)
+
+LOAD_LOOKBACK_DAYS = 7
+"""Days of measured household load to average for the PV gate.
+
+Seven smooths out a single anomalous day (an empty house, a party) while still
+tracking the seasonal trend that a fixed constant cannot. Measured against 149
+days of history a 3-day mean scored the same as a 7-day one, so the exact
+number is not sensitive; what matters is that it is measured at all.
+"""
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -130,6 +140,36 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         await _try_notify(ntfy, body, title=title, priority=prio, tags=["warning"])
         return 1
 
+    # Read-only pass over the portal's own daily table. Two things come from
+    # it: the load figure the PV gate should use instead of a hard-coded annual
+    # guess, and the actuals line that goes into the notification. Both are
+    # nice-to-have, so any failure here degrades to configured defaults rather
+    # than costing the night's schedule. Kept as a SEPARATE browser session
+    # from the write path so a read problem can never disturb the write.
+    totals: list[DailyTotals] = []
+    try:
+        async with LivoltekClient(settings) as reader:
+            await reader.login()
+            totals = await reader.read_daily_totals(
+                target_date - timedelta(days=LOAD_LOOKBACK_DAYS + 1),
+                target_date - timedelta(days=1),
+            )
+    except Exception as exc:  # noqa: BLE001 — Playwright raises broadly
+        log.warning(
+            "main.daily_totals_read_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+
+    measured_load = trailing_mean_load_kwh(totals, days=LOAD_LOOKBACK_DAYS)
+    latest = totals[-1] if totals else None
+    log.info(
+        "main.measured_load",
+        trailing_mean_kwh=round(measured_load, 2) if measured_load else None,
+        configured_kwh=settings.expected_daily_load_kwh,
+        days_read=len(totals),
+    )
+
     hourly = aggregate_hourly(periods)
     plan = plan_day(
         hourly,
@@ -137,6 +177,7 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         settings=settings,
         pv_forecast=pv,
         pv_forecast_failed=pv_failed,
+        measured_daily_load_kwh=measured_load,
     )
     log.info(
         "main.plan_ready",
@@ -146,7 +187,11 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
     )
 
     title, body, tags = format_plan_message(
-        plan, pv_forecast=pv, hourly_prices=hourly, settings=settings
+        plan,
+        pv_forecast=pv,
+        hourly_prices=hourly,
+        settings=settings,
+        yesterday=latest,
     )
     if not args.execute:
         title = f"[DRY-RUN] {title}"
