@@ -36,8 +36,30 @@ class Settings(BaseSettings):
     The charge side carries the uncertainty (see `battery_capacity_kwh`).
     Previously assumed 0.90, which overstated every cycle.
     """
+    wear_cost_per_cycle_eur: float = Field(default=0.05, ge=0.0)
+    """Marginal cost of putting the battery through one extra full cycle.
+
+    NOT `battery_price_eur / battery_cycle_life`. That derivation (€3000 /
+    6000 = €0.50) prices a cycle as if cycles were the binding constraint on
+    battery life. They are not: at roughly one cycle per day, 6000 cycles is
+    16 years, while LFP calendar life is 10–15. The battery will die of age
+    before it runs out of cycles, so the cycle we are deciding about is very
+    nearly free — the €3000 is spent either way.
+
+    €0.50 was therefore not conservatism, it was a wrong number, and it was
+    blocking cycles that genuinely pay. On 2026-09-04 it blocked a charge at
+    €0.034/kWh ahead of a €0.124/kWh evening; the battery instead sat at its
+    10 % floor through the morning peak and the house imported then.
+
+    €0.05 is a deliberately small non-zero figure: deep cycling does age cells
+    faster than resting, so a cycle is not free, but it is closer to free than
+    to €0.50. Raise it if the battery starts degrading faster than calendar
+    expectations — that is measurable from the portal's SOC-vs-delivered-kWh
+    ratio drifting over time.
+    """
     battery_price_eur: float = Field(default=3000.0, ge=0.0)
-    battery_cycle_life: int = Field(default=6000, gt=0)
+    """What the battery cost. Kept for reference and for judging whole-system
+    payback; deliberately NOT used to derive per-cycle wear (see above)."""
     max_cycles_per_day: int = Field(default=6, ge=0, le=6)
     hours_per_cycle: int = Field(default=2, ge=1)
     """Length of a Charge window in hours. Sizes the charge block only —
@@ -156,10 +178,6 @@ class Settings(BaseSettings):
     livoltek_storage_state_path: str = Field(default="browser-data/storage_state.json")
     livoltek_browser_timeout_s: float = Field(default=30.0, gt=0.0)
     livoltek_headless: bool = Field(default=False)
-
-    @property
-    def wear_cost_per_cycle_eur(self) -> float:
-        return self.battery_price_eur / self.battery_cycle_life
 
     @property
     def cycle_output_kwh(self) -> float:
