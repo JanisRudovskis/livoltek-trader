@@ -37,6 +37,24 @@ _WEEKDAY_LABELS = ["Mon.", "Tue.", "Wed.", "Thu.", "Fri.", "Sat.", "Sun."]
 log = structlog.get_logger(__name__)
 
 
+def _needs_save(plan: DailyPlan, *, tou_changed: bool) -> bool:
+    """Whether `Save Params.` has anything to commit.
+
+    A non-empty plan always rewrites slot rows, so it always needs saving. An
+    empty plan only touches the ToU toggle — and if the toggle was already in
+    the desired state, the form is byte-identical to what the inverter just
+    reported and there is nothing to issue.
+
+    Clicking Save anyway is not harmless: the portal returns no success toast
+    (it has no command to send), so `_verify_save_toast` warned
+    `livoltek.save.no_success_toast_seen` on every such night. Through summer,
+    when the PV gate empties most plans, that is a daily false alarm — and a
+    warning that cries wolf daily is a warning nobody reads on the night Save
+    genuinely fails.
+    """
+    return (not plan.is_empty) or tou_changed
+
+
 class LivoltekError(RuntimeError):
     """Raised on login or navigation failure."""
 
@@ -236,12 +254,16 @@ class LivoltekClient:
         await self._context.storage_state(path=str(path))
         log.info("livoltek.storage_state.saved", path=str(path))
 
-    async def navigate_to_system_mode(self) -> None:
-        """Walk from the homepage to Params set → System mode and read params.
+    async def navigate_to_device(self) -> None:
+        """Walk from the homepage to the inverter's device page.
 
-        After this returns, the System mode form is populated with the
-        inverter's current values (Work mode, Enable ToU toggle, schedule
-        rows, Grid Charging toggle).
+        Stops before any tab is opened, so callers can pick `Params set`
+        (the write path) or `Data report` (the read-only history path).
+
+        This is the ONE place the homepage → station → device walk lives.
+        It used to be copy-pasted into every script under `scripts/`, which is
+        why the 2026-09-02 selector change broke the production run and then
+        broke five diagnostic scripts separately, days apart.
         """
         page = self.page
         if self.HOME_URL_FRAGMENT not in page.url:
@@ -264,6 +286,16 @@ class LivoltekClient:
             f"**{self.DEVICE_URL_FRAGMENT}**", timeout=15000
         )
         log.info("livoltek.nav.device_reached")
+
+    async def navigate_to_system_mode(self) -> None:
+        """Walk to Params set → System mode and read the inverter's params.
+
+        After this returns, the System mode form is populated with the
+        inverter's current values (Work mode, Enable ToU toggle, schedule
+        rows, Grid Charging toggle).
+        """
+        page = self.page
+        await self.navigate_to_device()
 
         await page.get_by_role("tab", name="Params set", exact=True).click()
         await page.get_by_role("tab", name="System mode", exact=True).click()
@@ -297,28 +329,69 @@ class LivoltekClient:
                 f"device model must not contain a double quote: {model!r}"
             )
 
-        card_image = page.locator(
-            f'xpath=//*[contains(text(),"{model}")]'
+        # Scope to the Device List and to the card TITLE div. A first attempt
+        # used `//*[contains(text(),"<model>")]` unscoped: it matched 24
+        # elements (the model string also appears in the legend and alarm
+        # tables), `.first` picked the datalogger's card image instead of the
+        # inverter's, and the click silently went nowhere. It happened to work
+        # the day it was written because the match set was smaller then.
+        selector = (
+            f'xpath=//div[contains(@class,"deviceListToc")]'
+            f'//div[contains(@class,"el-descriptions__title")]'
+            f'[contains(.,"{model}")]'
             f"/ancestor::div[.//img][1]//img"
-        ).first
+        )
+        cards = page.locator(selector)
         try:
-            await card_image.click()
+            await cards.first.wait_for(state="visible", timeout=15000)
         except PlaywrightTimeoutError as exc:
-            # Name what we looked for and what the page actually offers, so the
-            # next portal change is one log line to diagnose instead of a bare
-            # Playwright timeout.
-            labels = await page.evaluate(
-                """() => Array.from(document.querySelectorAll('.el-descriptions__title'))
+            raise await self._device_card_error(model, exc)
+
+        # Insist on exactly one match. An ambiguous selector that clicks the
+        # wrong card is far worse than one that refuses: the click "succeeds",
+        # navigation never happens, and the failure surfaces 15 s later as an
+        # unrelated timeout.
+        count = await cards.count()
+        if count != 1:
+            raise await self._device_card_error(
+                model, None, f"selector matched {count} elements, expected 1"
+            )
+
+        try:
+            await cards.click()
+        except PlaywrightTimeoutError as exc:
+            raise await self._device_card_error(model, exc)
+        log.info("livoltek.nav.device_card_clicked", model=model)
+
+    async def _device_card_error(
+        self,
+        model: str,
+        cause: Exception | None,
+        detail: str = "no matching card image",
+    ) -> LivoltekError:
+        """Build a diagnosable error naming the model and the page's own labels.
+
+        Without this the failure reads as a bare Playwright timeout, which is
+        what made the 2026-09-02 breakage take a full day to spot.
+        """
+        try:
+            labels = await self.page.evaluate(
+                """() => Array.from(
+                        document.querySelectorAll('.el-descriptions__title'))
                     .map(e => (e.textContent || '').trim())
                     .filter(Boolean)"""
             )
-            raise LivoltekError(
-                f"device card for model {model!r} not found on the station "
-                f"page. Device List shows: {labels}. If the model is right, "
-                f"the portal's Device List markup changed — run "
-                f"scripts/livoltek_peek_device_dom.py to re-derive the anchor."
-            ) from exc
-        log.info("livoltek.nav.device_card_clicked", model=model)
+        except Exception:  # noqa: BLE001 — diagnostics must never mask the error
+            labels = ["<could not read page labels>"]
+        err = LivoltekError(
+            f"could not open the device card for model {model!r}: {detail}. "
+            f"Device List shows: {labels}. If the model is right, the portal's "
+            f"Device List markup changed — run "
+            f"scripts/livoltek_peek_device_dom.py to re-derive the anchor."
+        )
+        if cause is not None:
+            err.__cause__ = cause
+        return err
 
     async def apply_schedule(self, plan: DailyPlan, *, save: bool = False) -> None:
         """Write the day's plan to the System mode form.
@@ -338,10 +411,10 @@ class LivoltekClient:
         """
         page = self.page
         if plan.is_empty:
-            await self._set_tou_enabled(False)
+            tou_changed = await self._set_tou_enabled(False)
             log.info("livoltek.apply_schedule.skip_day", reason=plan.skipped_reason)
         else:
-            await self._set_tou_enabled(True)
+            tou_changed = await self._set_tou_enabled(True)
             # Use the PLAN's weekday, not "now". The cron runs the evening
             # before the trading day, so `datetime.now().weekday()` would
             # be off by one and the slot would fire today instead of
@@ -371,12 +444,21 @@ class LivoltekClient:
                 weekday=target_weekday,
             )
 
-        if save:
-            await page.get_by_role("button", name="Save Params.").first.click()
-            await self._verify_save_toast()
-            log.info("livoltek.apply_schedule.saved")
-        else:
+        if not save:
             log.info("livoltek.apply_schedule.dry_run_form_filled")
+            return
+
+        if not _needs_save(plan, tou_changed=tou_changed):
+            # Nothing was touched, so the portal has no command to issue and
+            # would return no success toast. Clicking Save anyway produced a
+            # daily false `no_success_toast_seen` warning through summer, which
+            # is how a real Save failure would get overlooked.
+            log.info("livoltek.apply_schedule.nothing_to_save")
+            return
+
+        await page.get_by_role("button", name="Save Params.").first.click()
+        await self._verify_save_toast()
+        log.info("livoltek.apply_schedule.saved")
 
     async def _verify_save_toast(self, timeout_ms: int = 8000) -> None:
         """Wait for the green success toast after Save Params; warn otherwise.
@@ -394,7 +476,8 @@ class LivoltekClient:
         except PlaywrightTimeoutError:
             log.warning("livoltek.save.no_success_toast_seen")
 
-    async def _set_tou_enabled(self, enabled: bool) -> None:
+    async def _set_tou_enabled(self, enabled: bool) -> bool:
+        """Set the ToU toggle. Returns True if the form actually changed."""
         page = self.page
         toggle_row = page.locator('text="Enable ToU schedule"').locator(
             'xpath=following-sibling::*[contains(@class, "el-switch")][1]'
@@ -404,8 +487,9 @@ class LivoltekClient:
         if is_on != enabled:
             await toggle_row.click()
             log.info("livoltek.tou_toggle.set", enabled=enabled)
-        else:
-            log.info("livoltek.tou_toggle.already", enabled=enabled)
+            return True
+        log.info("livoltek.tou_toggle.already", enabled=enabled)
+        return False
 
     async def _fill_charge_slot(
         self, slot_idx: int, cycle: CyclePair, weekday: str

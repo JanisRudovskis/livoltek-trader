@@ -120,27 +120,7 @@ async def main() -> int:
             await client.login()
 
             # Walk homepage -> station -> device, stopping BEFORE Params set.
-            if client.HOME_URL_FRAGMENT not in page.url:
-                await page.goto(
-                    f"https://{client.EU_HOST}/#{client.HOME_URL_FRAGMENT}",
-                    wait_until="domcontentloaded",
-                )
-                await page.wait_for_url(
-                    f"**{client.HOME_URL_FRAGMENT}**", timeout=10000
-                )
-
-            await page.locator(".deviceIcon").first.click()
-            await page.wait_for_url(
-                f"**{client.STATION_URL_FRAGMENT}**", timeout=15000
-            )
-            await asyncio.sleep(2.0)
-            await page.screenshot(path=str(OUT / "01-station.png"), full_page=True)
-
-            await page.locator('img[src*="hp3_online"]').first.click()
-            await page.wait_for_url(
-                f"**{client.DEVICE_URL_FRAGMENT}**", timeout=15000
-            )
-            await asyncio.sleep(2.0)
+            await client.navigate_to_device()
             await page.screenshot(path=str(OUT / "02-device.png"), full_page=True)
 
             # Enumerate every tab on the device page so we can see what data

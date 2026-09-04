@@ -115,24 +115,7 @@ async def main(argv: list[str]) -> int:
             page.on("request", on_request)
             await client.login()
 
-            if client.HOME_URL_FRAGMENT not in page.url:
-                await page.goto(
-                    f"https://{client.EU_HOST}/#{client.HOME_URL_FRAGMENT}",
-                    wait_until="domcontentloaded",
-                )
-                await page.wait_for_url(
-                    f"**{client.HOME_URL_FRAGMENT}**", timeout=10000
-                )
-            await page.locator(".deviceIcon").first.click()
-            await page.wait_for_url(
-                f"**{client.STATION_URL_FRAGMENT}**", timeout=15000
-            )
-            await asyncio.sleep(1.5)
-            await page.locator('img[src*="hp3_online"]').first.click()
-            await page.wait_for_url(
-                f"**{client.DEVICE_URL_FRAGMENT}**", timeout=15000
-            )
-            await asyncio.sleep(1.5)
+            await client.navigate_to_device()
             try:
                 await page.get_by_role(
                     "tab", name="Data report", exact=True
