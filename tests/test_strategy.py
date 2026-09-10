@@ -294,7 +294,12 @@ def _pv(target: date, kwh: float) -> PvForecast:
 
 
 def test_plan_day_skips_when_pv_covers_load(settings):
-    # PV (30) > load (22) — gap 0, well below one cycle output (5).
+    """PV (30) exceeding load (22) leaves nothing to displace, so no cycle.
+
+    Note this is now an outcome of the valuation, not of a separate gate: the
+    cycle is worth zero because it would save nothing, and zero is below the
+    profit threshold.
+    """
     settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
     hourly = _strong_spread_hourly(9)
     plan = plan_day(
@@ -304,7 +309,7 @@ def test_plan_day_skips_when_pv_covers_load(settings):
         pv_forecast=_pv(date(2026, 5, 9), kwh=30.0),
     )
     assert plan.cycles == []
-    assert plan.skipped_reason and "PV forecast" in plan.skipped_reason
+    assert plan.skipped_reason and plan.skipped_reason.startswith("no cycle nets")
 
 
 def test_plan_day_proceeds_when_gap_exceeds_cycle_output(settings):
@@ -321,8 +326,14 @@ def test_plan_day_proceeds_when_gap_exceeds_cycle_output(settings):
     assert plan.skipped_reason is None
 
 
-def test_plan_day_skips_when_gap_below_one_cycle(settings):
-    # Gap = 22 - 19 = 3 kWh, cycle output = 5 kWh — cycle would over-fill.
+def test_partial_displacement_is_still_worth_taking(settings):
+    """A 3 kWh gap against a 5 kWh battery must NOT be discarded.
+
+    The old gate demanded a full cycle's worth of import and skipped anything
+    less. Displacing 3 kWh at a good spread is plainly worth doing, and
+    insisting on a full cycle is what left the planner idle for a week in
+    September 2026.
+    """
     settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
     hourly = _strong_spread_hourly(9)
     plan = plan_day(
@@ -331,8 +342,61 @@ def test_plan_day_skips_when_gap_below_one_cycle(settings):
         settings,
         pv_forecast=_pv(date(2026, 5, 9), kwh=19.0),
     )
+    assert plan.cycles, "3 kWh of displaceable import is a real saving"
+    full = plan_day(hourly, date(2026, 5, 9), settings)
+    assert plan.total_net_profit_eur < full.total_net_profit_eur
+
+
+def test_cycle_is_valued_on_what_it_can_actually_displace(measured):
+    """A cycle can only save money on energy the house would have imported.
+
+    The old binary PV gate asked "will PV cover the DAY?" and compared daily
+    totals. Daily totals cannot see timing: 2026-09-08 produced 29 kWh of PV
+    and still imported 17.9 kWh after sunset, and the gate skipped it. Over
+    2026-09-04..10 that gate blocked five profitable days worth EUR 3.52.
+
+    Replaced by scaling the cycle to the displaceable energy, so a day with
+    little import yields little value and falls under the profit gate by
+    itself — no separate gate needed.
+    """
+    hourly = _hourly_series(9, _reference_day_prices())
+
+    full = plan_day(hourly, date(2026, 5, 9), measured)
+    assert full.cycles
+    full_net = full.total_net_profit_eur
+
+    half = plan_day(
+        hourly, date(2026, 5, 9), measured, displaceable_kwh=4.4
+    )
+    assert half.cycles, "half a cycle's worth of import is still worth taking"
+    assert half.total_net_profit_eur < full_net
+    assert half.cycles[0].net_profit_eur == pytest.approx(full_net / 2, rel=0.05)
+
+
+def test_a_day_with_nothing_to_displace_plans_nothing(measured):
+    """No import to save on means no cycle, without a separate gate."""
+    hourly = _hourly_series(9, _reference_day_prices())
+    plan = plan_day(hourly, date(2026, 5, 9), measured, displaceable_kwh=0.2)
     assert plan.cycles == []
-    assert plan.skipped_reason and "below one cycle output" in plan.skipped_reason
+
+
+def test_displaceable_energy_never_exceeds_one_cycle(measured):
+    """A huge import figure cannot inflate the cycle beyond the battery."""
+    hourly = _hourly_series(9, _reference_day_prices())
+    capped = plan_day(hourly, date(2026, 5, 9), measured, displaceable_kwh=500.0)
+    uncapped = plan_day(hourly, date(2026, 5, 9), measured)
+    assert capped.total_net_profit_eur == pytest.approx(
+        uncapped.total_net_profit_eur
+    )
+
+
+def test_partial_cycles_wear_the_battery_proportionally(measured):
+    """Delivering half a cycle must not be charged a whole cycle of wear."""
+    hourly = _hourly_series(9, _reference_day_prices())
+    half = plan_day(hourly, date(2026, 5, 9), measured, displaceable_kwh=4.4)
+    assert half.cycles[0].wear_cost_eur == pytest.approx(
+        measured.wear_cost_per_cycle_eur / 2, rel=0.05
+    )
 
 
 def test_pv_gate_prefers_measured_load_over_the_configured_constant(settings):
@@ -343,20 +407,15 @@ def test_pv_gate_prefers_measured_load_over_the_configured_constant(settings):
     gate under-states winter grid imports and skips cycles on exactly the cold
     days that pay best.
 
-    Here PV is 18 kWh and one cycle delivers 5 kWh. Against the constant 22 the
-    gap is 4 kWh and cycles are skipped; against a measured 30 kWh the gap is
-    12 kWh and they are planned.
+    Here PV is 18 kWh and one cycle delivers 5 kWh. Against the constant 22
+    only 4 kWh is displaceable; against a measured 30 kWh the full battery
+    is, so the same day is worth materially more.
     """
     settings = settings.model_copy(update={"expected_daily_load_kwh": 22.0})
     hourly = _strong_spread_hourly(9)
     pv = _pv(date(2026, 5, 9), kwh=18.0)
 
     on_constant = plan_day(hourly, date(2026, 5, 9), settings, pv_forecast=pv)
-    assert on_constant.cycles == []
-    assert on_constant.skipped_reason and "below one cycle output" in (
-        on_constant.skipped_reason
-    )
-
     on_measured = plan_day(
         hourly,
         date(2026, 5, 9),
@@ -364,7 +423,9 @@ def test_pv_gate_prefers_measured_load_over_the_configured_constant(settings):
         pv_forecast=pv,
         measured_daily_load_kwh=30.0,
     )
-    assert on_measured.cycles, "a real 30 kWh load leaves plenty to displace"
+    # Constant 22 leaves 4 kWh displaceable; a measured 30 leaves 12, which is
+    # more than the 5 kWh battery, so the cycle runs at full value.
+    assert on_measured.total_net_profit_eur > on_constant.total_net_profit_eur
 
 
 def test_pv_gate_falls_back_to_the_constant_when_load_is_unmeasured(settings):

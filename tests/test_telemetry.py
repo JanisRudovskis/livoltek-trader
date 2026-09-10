@@ -10,6 +10,7 @@ from livoltek_trader.telemetry import (
     DailyTotals,
     format_daily_totals_line,
     parse_daily_rows,
+    trailing_mean_import_kwh,
     trailing_mean_load_kwh,
 )
 
@@ -108,6 +109,40 @@ def test_trailing_mean_load_ignores_zero_load_days():
         ]
     )
     assert trailing_mean_load_kwh(rows, days=7) == pytest.approx(17.3)
+
+
+def test_trailing_mean_import_is_what_a_cycle_can_displace():
+    rows = parse_daily_rows(
+        [
+            _row("2026-09-06", 30.6, 2.6, 14.1, 10.0, 9.0, 19.0),
+            _row("2026-09-07", 38.0, 3.5, 21.3, 10.0, 9.0, 19.1),
+            _row("2026-09-08", 29.1, 17.9, 4.0, 10.0, 9.0, 43.9),
+        ]
+    )
+    assert trailing_mean_import_kwh(rows, days=3) == pytest.approx(
+        (2.6 + 3.5 + 17.9) / 3
+    )
+    assert trailing_mean_import_kwh(rows, days=2) == pytest.approx(
+        (3.5 + 17.9) / 2
+    )
+
+
+def test_trailing_mean_import_is_none_without_data():
+    assert trailing_mean_import_kwh([], days=7) is None
+
+
+def test_trailing_mean_import_keeps_genuine_zero_import_days():
+    """A day that imported nothing is real data and must pull the mean down.
+
+    Only days the inverter did not report at all (zero LOAD) are dropped.
+    """
+    rows = parse_daily_rows(
+        [
+            _row("2026-09-01", 12.6, 0.0, 0.0, 7.2, 9.8, 15.2),
+            _row("2026-09-02", 28.1, 4.0, 10.6, 10.8, 7.9, 17.3),
+        ]
+    )
+    assert trailing_mean_import_kwh(rows, days=7) == pytest.approx(2.0)
 
 
 def test_format_daily_line_leads_with_grid_import():

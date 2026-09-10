@@ -173,24 +173,36 @@ def _derive_drain_window(
 
 
 def _build_cycle(
-    charge: TradingWindow, drain: TradingWindow, settings: Settings
+    charge: TradingWindow,
+    drain: TradingWindow,
+    settings: Settings,
+    delivered_kwh: float | None = None,
 ) -> CyclePair:
     """Value one charge window against its derived drain window.
 
-    We buy `battery_capacity_kwh` from the grid at the charge window's price
-    and avoid buying `cycle_output_kwh` at the drain window's price. The
-    supplier margin cancels between the two legs *except* on round-trip
-    losses, which is the `margin * (bought - delivered)` term — about €0.14
-    per cycle at measured constants, and omitted by the previous formula.
+    We buy energy at the charge window's price and avoid buying it back at the
+    drain window's price. The supplier margin cancels between the two legs
+    *except* on round-trip losses — the `margin * (bought - delivered)` term,
+    about €0.14 for a full cycle at measured constants, and omitted entirely
+    by the pre-2026-08 formula.
+
+    `delivered_kwh` is how much the house can actually take off the battery
+    instead of the grid, capped at one cycle. A cycle only saves money on
+    energy that would otherwise have been imported, so a day with little
+    import is worth proportionally little. Wear scales with it too: half a
+    cycle ages the battery about half as much.
     """
-    bought = settings.battery_capacity_kwh
-    delivered = settings.cycle_output_kwh
+    full = settings.cycle_output_kwh
+    delivered = full if delivered_kwh is None else max(0.0, min(full, delivered_kwh))
+    # Derive the purchase from the delivery so the two can never drift apart:
+    # capacity / output is exactly the round-trip efficiency.
+    bought = delivered / settings.round_trip_efficiency
     gross = (
         delivered * drain.avg_eur_per_kwh
         - bought * charge.avg_eur_per_kwh
         - settings.buy_margin_eur_per_kwh * (bought - delivered)
     )
-    wear = settings.wear_cost_per_cycle_eur
+    wear = settings.wear_cost_per_cycle_eur * (delivered / full if full else 1.0)
     return CyclePair(
         charge=charge,
         discharge=drain,
@@ -299,6 +311,7 @@ def plan_day(
     pv_forecast: PvForecast | None = None,
     pv_forecast_failed: bool = False,
     measured_daily_load_kwh: float | None = None,
+    displaceable_kwh: float | None = None,
 ) -> DailyPlan:
     """Pick the best footprint-disjoint set of grid-charge cycles for the day.
 
@@ -381,17 +394,23 @@ def plan_day(
         else settings.expected_daily_load_kwh
     )
 
-    if pv_forecast is not None:
-        expected_grid_imports = max(
+    # How much of a cycle the house could actually take off the battery
+    # instead of the grid. Prefer a measured figure; fall back to the PV
+    # forecast against load.
+    #
+    # This USED to be a binary gate: skip all cycles unless
+    # `load - PV >= cycle_output`. That was wrong twice over. It compared
+    # DAILY TOTALS, which cannot see timing — 2026-09-08 produced 29 kWh of PV
+    # and still imported 17.9 kWh after sunset — and it demanded a FULL
+    # cycle's worth of import, when displacing half a cycle is still worth
+    # doing. Between them they blocked five profitable days out of seven
+    # (2026-09-04..10, EUR 3.52 forgone). Now the cycle is simply valued on
+    # what it can displace, and thin days fall under the profit gate on their
+    # own.
+    if displaceable_kwh is None and pv_forecast is not None:
+        displaceable_kwh = max(
             0.0, daily_load_kwh - pv_forecast.expected_kwh
         )
-        if expected_grid_imports < settings.cycle_output_kwh:
-            cycle_skip_reason = (
-                f"PV forecast {pv_forecast.expected_kwh:.1f} kWh vs load "
-                f"{daily_load_kwh:.1f} kWh leaves only "
-                f"{expected_grid_imports:.1f} kWh grid imports — below one "
-                f"cycle output ({settings.cycle_output_kwh:.1f} kWh)"
-            )
 
     if cycle_skip_reason is None:
         # A cycle needs its charge block AND a full drain window inside the
@@ -411,7 +430,7 @@ def plan_day(
                 )
                 if drain is None:
                     continue  # no full drain window — see _derive_drain_window
-                cycle = _build_cycle(charge, drain, settings)
+                cycle = _build_cycle(charge, drain, settings, displaceable_kwh)
                 if cycle.net_profit_eur < threshold:
                     continue
                 candidates.append(cycle)

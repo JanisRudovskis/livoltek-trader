@@ -121,6 +121,39 @@ def trailing_mean_load_kwh(
     return sum(window) / len(window)
 
 
+def trailing_mean_import_kwh(
+    totals: list[DailyTotals], *, days: int = 7
+) -> float | None:
+    """Mean grid import over the most recent `days` days with real data.
+
+    This is the energy a cycle can actually displace: what the house buys when
+    the battery is left to its own devices. Measured rather than forecast on
+    purpose — `load − PV forecast` was tried and produced ZERO cycles across
+    2026-09-04..10, because the PV forecast repeatedly said the sun would
+    cover a day that went on to import anyway (2026-09-08: 29 kWh of PV, 17.9
+    kWh imported after sunset).
+
+    It is deliberately conservative. Under-stating displaceable energy can only
+    cost forgone profit; over-stating it buys grid energy the sun would have
+    supplied free, and the export tariff makes that swap lose €0.07/kWh.
+
+    Note it is inert in winter: imports there run 15–25 kWh/day, well above one
+    cycle, so the cap never binds and winter planning is unaffected.
+
+    Days whose totals are all zero are dropped — that means the inverter
+    reported nothing, not that the house drew nothing.
+    """
+    usable = [
+        t.grid_import_kwh
+        for t in totals
+        if t.load_kwh > 0  # a real reporting day
+    ]
+    if not usable:
+        return None
+    window = usable[-days:] if days > 0 else usable
+    return sum(window) / len(window)
+
+
 def format_daily_totals_line(
     totals: DailyTotals,
     *,

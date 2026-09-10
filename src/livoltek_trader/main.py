@@ -36,7 +36,11 @@ from livoltek_trader.notify import (
 )
 from livoltek_trader.solar import OpenMeteoAPIError, fetch_pv_forecast
 from livoltek_trader.strategy import aggregate_hourly, plan_day
-from livoltek_trader.telemetry import DailyTotals, trailing_mean_load_kwh
+from livoltek_trader.telemetry import (
+    DailyTotals,
+    trailing_mean_import_kwh,
+    trailing_mean_load_kwh,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -162,10 +166,16 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         )
 
     measured_load = trailing_mean_load_kwh(totals, days=LOAD_LOOKBACK_DAYS)
+    # What a cycle can actually displace: what the house buys when the battery
+    # is left alone. Measured, not forecast — `load − PV forecast` was tried
+    # and produced zero cycles across a whole week, because the forecast kept
+    # claiming the sun would cover days that imported anyway.
+    displaceable = trailing_mean_import_kwh(totals, days=LOAD_LOOKBACK_DAYS)
     latest = totals[-1] if totals else None
     log.info(
         "main.measured_load",
         trailing_mean_kwh=round(measured_load, 2) if measured_load else None,
+        trailing_import_kwh=round(displaceable, 2) if displaceable else None,
         configured_kwh=settings.expected_daily_load_kwh,
         days_read=len(totals),
     )
@@ -178,6 +188,7 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         pv_forecast=pv,
         pv_forecast_failed=pv_failed,
         measured_daily_load_kwh=measured_load,
+        displaceable_kwh=displaceable,
     )
     log.info(
         "main.plan_ready",
