@@ -541,6 +541,26 @@ correct decision may be to leave ToU off in winter.
 - **Any nightly telemetry push (Railway Volume, GitHub API, second cron)** —
   §5.1, unnecessary given unlimited portal retention.
 - **A `collect` CLI subcommand** — §5.2, the scripts cover it.
+- **An intraday SOC check that writes a Charge slot** — a late-afternoon run
+  that reads actual SOC and charges if the evening looks bad. Rejected on
+  **measurement**, not on the earlier hand-wave, and the idea itself is sound:
+  it replaces a forecast with an observation, and every planning failure so far
+  has come from a forecast being wrong.
+
+  `scripts/size_intraday_check.py` over 118 measured days (Apr–May, Jul–Sep
+  2026) finds it would fire on **6 days**, ~23 kWh of addressable evening
+  import — about **€0.45/month**. On the other 112 days the battery was at
+  94–100 % at 17:00 because PV had already filled it. That does not pay for a
+  second Playwright write path, the component behind most production incidents.
+
+  **Revisit in December**, when winter data exists (the battery will not be
+  full at 17:00 then, and 2026/27 is the system's first winter). Two commands
+  settle it: `livoltek_harvest_history.py 2026-11-01 2026-12-31`, then
+  `size_intraday_check.py`. Build it if it fires on a large share of winter
+  days. Counter-argument to weigh then: in deep winter the nightly plan already
+  has what it needs — PV forecast ~2 kWh with little uncertainty, imports
+  15–25 kWh — so the check may largely duplicate it. Its real value is the
+  shoulder season, where the PV forecast is least reliable.
 
 ---
 
