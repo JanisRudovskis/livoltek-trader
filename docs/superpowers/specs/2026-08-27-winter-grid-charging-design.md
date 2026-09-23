@@ -541,6 +541,32 @@ correct decision may be to leave ToU off in winter.
 - **Any nightly telemetry push (Railway Volume, GitHub API, second cron)** —
   §5.1, unnecessary given unlimited portal retention.
 - **A `collect` CLI subcommand** — §5.2, the scripts cover it.
+- **A separate "charge before the morning peak" rule** — requested 2026-09-23
+  after the battery was repeatedly found at 10 % SOC at 06:00 (9 of 13 days),
+  with 25.6 kWh of 06–10h imports over two weeks. Measured, and **no code is
+  needed: winter already does this.**
+
+  Replaying real Jan–Feb 2026 prices through the current planner, the charge
+  hours it picks are **03h ×6, 04h ×10, 05h ×12**, and **29 of its 30 cycles
+  have a drain window covering 06–09h**. A night→morning charge is viable on
+  47 of 59 winter days (80 %), median margin €0.0705/kWh. The planner finds
+  those windows with no change because they are simply the best-scoring ones.
+
+  It does not happen in September because it would lose money there: night and
+  morning are both non-solar hours and are priced together (morning €0.26
+  against night €0.19), so there is no spread to capture — chasing it is worth
+  €0.39/month, and only one day in ten is positive. September's real spread is
+  solar-midday against everything else, which is why the planner charges at
+  14–15h and covers the evening instead.
+
+  **Consequence to expect in December, not a bug:** exactly one cycle fires per
+  winter day (30 cycles across 30 firing days), and it is the morning one. The
+  second-best disjoint cycle is never profitable — median net **−€0.93**, best
+  −€0.29 — because a 9-hour footprint pushes it into the winter afternoon,
+  which has no cheap hours. So the evening peak goes uncovered in winter. The
+  September evening behaviour that currently works will disappear, and is
+  likely to be reported as a regression.
+
 - **An intraday SOC check that writes a Charge slot** — a late-afternoon run
   that reads actual SOC and charges if the evening looks bad. Rejected on
   **measurement**, not on the earlier hand-wave, and the idea itself is sound:
