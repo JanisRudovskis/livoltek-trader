@@ -68,6 +68,8 @@ class _StubPortal:
         self.totals = totals if totals is not None else []
         self.fail = fail
         self.write_fail: Exception | None = None
+        self.write_failures: list[Exception] = []  # raised once each, in order
+        self.write_calls = 0
         self.written: list = []
 
     async def __aenter__(self):
@@ -86,9 +88,17 @@ class _StubPortal:
         return list(self.totals)
 
     async def write_schedule(self, plan) -> None:
+        self.write_calls += 1
+        if self.write_failures:
+            raise self.write_failures.pop(0)
         if self.write_fail is not None:
             raise self.write_fail
         self.written.append(plan)
+
+
+@pytest.fixture(autouse=True)
+def no_retry_pause(monkeypatch) -> None:
+    monkeypatch.setattr(main_mod, "PORTAL_RETRY_PAUSE_S", 0)
 
 
 @pytest.fixture(autouse=True)
@@ -407,3 +417,47 @@ async def test_tonights_prices_are_optional(monkeypatch, args, settings, stub_nt
     monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
     assert await main_mod._run(args, settings) == 0
     assert stub_ntfy.sent
+
+
+# --- transient portal failures are retried ---------------------------------------
+
+
+async def test_portal_write_is_retried_after_a_transient_failure(
+    monkeypatch, args, settings, stub_ntfy, no_real_portal
+):
+    import structlog
+    from livoltek_trader.livoltek import DeviceListEmptyError
+
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", _pv_ok())
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    no_real_portal.write_failures = [DeviceListEmptyError("Device List shows: []")]
+    args.execute = True
+    with structlog.testing.capture_logs() as logs:
+        rc = await main_mod._run(args, settings)
+    assert rc == 0
+    assert no_real_portal.write_calls == 2 and len(no_real_portal.written) == 1
+    failed = [e for e in logs if e["event"].endswith("attempt_failed")]
+    assert failed and failed[0]["error_type"] == "DeviceListEmptyError"
+    assert all(prio != 4 for _t, _b, prio in stub_ntfy.sent), "no alarm on recovery"
+
+
+async def test_when_every_attempt_fails_one_alarm_lists_them(
+    monkeypatch, args, settings, stub_ntfy, no_real_portal
+):
+    from livoltek_trader.livoltek import DeviceListEmptyError
+
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", _pv_ok())
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    no_real_portal.write_fail = DeviceListEmptyError("Device List shows: []")
+    args.execute = True
+    assert await main_mod._run(args, settings) == 1
+    assert no_real_portal.write_calls == main_mod.PORTAL_ATTEMPTS
+    alarms = [m for m in stub_ntfy.sent if m[2] == 4]
+    assert len(alarms) == 1
+    assert alarms[0][1].count("DeviceListEmptyError") == main_mod.PORTAL_ATTEMPTS

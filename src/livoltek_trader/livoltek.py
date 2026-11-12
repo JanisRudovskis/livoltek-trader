@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import calendar
 import json
-from typing import Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Protocol, TypeVar
 from contextlib import AsyncExitStack
 from datetime import date
 from pathlib import Path
@@ -44,6 +44,59 @@ log = structlog.get_logger(__name__)
 
 class LivoltekError(RuntimeError):
     """Raised on login, navigation or schedule-write failure."""
+
+
+class DeviceListEmptyError(LivoltekError):
+    """The station page rendered no Device List at all.
+
+    Seen 2026-11-12 ("Device List shows: []"): the list simply had not
+    loaded within the wait. A fresh session fixes it, so it is retryable —
+    unlike a list that renders but no longer contains our model, which means
+    the markup or the configured model changed.
+    """
+
+
+class RetriesExhausted(LivoltekError):
+    """Every attempt of a retried portal operation failed."""
+
+
+T = TypeVar("T")
+
+
+async def with_retries(
+    op: Callable[[], Awaitable[T]],
+    *,
+    attempts: int,
+    pause_s: float,
+    what: str,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> T:
+    """Run `op` up to `attempts` times, pausing between failures.
+
+    Every failure is logged as `<what>.attempt_failed` with its error type,
+    so how often the portal hiccups — and how — can be read straight from
+    the Railway logs. Only if all attempts fail is the error raised, listing
+    each attempt, so one alarm says everything.
+    """
+    errors: list[BaseException] = []
+    for attempt in range(1, attempts + 1):
+        try:
+            return await op()
+        except Exception as exc:  # noqa: BLE001 — Playwright raises broadly
+            errors.append(exc)
+            log.warning(
+                f"{what}.attempt_failed",
+                attempt=attempt,
+                of=attempts,
+                error_type=type(exc).__name__,
+                error=str(exc)[:300],
+            )
+            if attempt < attempts:
+                await sleep(pause_s)
+    summary = "; ".join(
+        f"#{i} {type(e).__name__}: {str(e)[:200]}" for i, e in enumerate(errors, 1)
+    )
+    raise RetriesExhausted(f"{attempts} attempts failed — {summary}") from errors[-1]
 
 
 class PortalBusyError(LivoltekError):
@@ -570,6 +623,15 @@ class LivoltekClient:
             )
         except Exception:  # noqa: BLE001 — diagnostics must never mask the error
             labels = ["<could not read page labels>"]
+        if labels == []:
+            # Nothing rendered at all: the list did not load. Transient.
+            err: LivoltekError = DeviceListEmptyError(
+                f"could not open the device card for model {model!r}: the "
+                f"station page rendered no Device List ({detail}); retry"
+            )
+            if cause is not None:
+                err.__cause__ = cause
+            return err
         err = LivoltekError(
             f"could not open the device card for model {model!r}: {detail}. "
             f"Device List shows: {labels}. If the model is right, the portal's "

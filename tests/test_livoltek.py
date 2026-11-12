@@ -12,10 +12,13 @@ import pytest
 from livoltek_trader.config import Settings
 from livoltek_trader.livoltek import (
     LivoltekClient,
+    DeviceListEmptyError,
     LivoltekError,
     PortalBusyError,
+    RetriesExhausted,
     apply_register_steps,
     points_by_address,
+    with_retries,
 )
 
 
@@ -159,3 +162,60 @@ def test_page_raises_before_context_entry():
     client = LivoltekClient(Settings())
     with pytest.raises(LivoltekError, match="not initialised"):
         _ = client.page
+
+
+# --- telling a transient portal hiccup from a real breakage ---------------------
+
+
+class _PageWithLabels:
+    def __init__(self, labels) -> None:
+        self.labels = labels
+
+    async def evaluate(self, _js):
+        return self.labels
+
+
+async def test_an_empty_device_list_is_its_own_transient_error():
+    """2026-11-12: the station page sometimes renders no Device List at all
+    within 15 s ("Device List shows: []"). Reloading fixes it, so it gets its
+    own type — retryable, and countable in the logs."""
+    client = LivoltekClient(Settings())
+    client._page = _PageWithLabels([])
+    err = await client._device_card_error("HP3-10KD2", None)
+    assert isinstance(err, DeviceListEmptyError)
+
+
+async def test_a_device_list_without_our_model_is_not_called_transient():
+    # Labels present but no match = markup or model changed. Not a hiccup.
+    client = LivoltekClient(Settings())
+    client._page = _PageWithLabels(["SN123(DATALOGGER)"])
+    err = await client._device_card_error("HP3-10KD2", None)
+    assert not isinstance(err, DeviceListEmptyError)
+    assert isinstance(err, LivoltekError)
+
+
+async def test_with_retries_returns_once_an_attempt_succeeds():
+    calls = []
+    slept: list[float] = []
+
+    async def op():
+        calls.append(1)
+        if len(calls) < 3:
+            raise DeviceListEmptyError("Device List shows: []")
+        return "ok"
+
+    async def sleep(s):
+        slept.append(s)
+
+    assert await with_retries(op, attempts=3, pause_s=60, what="t", sleep=sleep) == "ok"
+    assert len(calls) == 3 and slept == [60, 60]
+
+
+async def test_with_retries_reports_every_failed_attempt():
+    async def op():
+        raise DeviceListEmptyError("Device List shows: []")
+
+    with pytest.raises(RetriesExhausted) as info:
+        await with_retries(op, attempts=3, pause_s=0, what="t", sleep=_no_sleep)
+    msg = str(info.value)
+    assert "3" in msg and msg.count("DeviceListEmptyError") == 3

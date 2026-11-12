@@ -30,7 +30,7 @@ RIGA_TZ = ZoneInfo("Europe/Riga")
 from livoltek_trader.config import Settings, get_settings
 from livoltek_trader.elering import ElerinAPIError, fetch_day_ahead
 from livoltek_trader.ev import advise_ev
-from livoltek_trader.livoltek import LivoltekClient
+from livoltek_trader.livoltek import LivoltekClient, with_retries
 from livoltek_trader.notify import (
     NtfyClient,
     NtfyError,
@@ -46,6 +46,15 @@ from livoltek_trader.telemetry import (
 )
 
 log = structlog.get_logger(__name__)
+
+PORTAL_ATTEMPTS = 3
+PORTAL_RETRY_PAUSE_S = 60
+"""The portal session (fresh browser, login, write) is retried as a whole.
+
+Safe because the write starts from what the device holds each time. The
+known transient is the station page rendering no Device List
+(`DeviceListEmptyError`, 2026-11-12); a minute and a fresh session fixes it.
+"""
 
 LOAD_LOOKBACK_DAYS = 7
 """Days of measured household load to average for the PV gate.
@@ -171,14 +180,22 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
     # nice-to-have, so any failure here degrades to configured defaults rather
     # than costing the night's schedule. Kept as a SEPARATE browser session
     # from the write path so a read problem can never disturb the write.
-    totals: list[DailyTotals] = []
-    try:
+    async def _read_totals() -> list[DailyTotals]:
         async with LivoltekClient(settings) as reader:
             await reader.login()
-            totals = await reader.read_daily_totals(
+            return await reader.read_daily_totals(
                 target_date - timedelta(days=LOAD_LOOKBACK_DAYS + 1),
                 target_date - timedelta(days=1),
             )
+
+    totals: list[DailyTotals] = []
+    try:
+        totals = await with_retries(
+            _read_totals,
+            attempts=2,
+            pause_s=PORTAL_RETRY_PAUSE_S,
+            what="main.portal_read",
+        )
     except Exception as exc:  # noqa: BLE001 — Playwright raises broadly
         log.warning(
             "main.daily_totals_read_failed",
@@ -250,10 +267,18 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         log.info("main.dry_run_complete")
         return 0
 
-    try:
+    async def _write() -> None:
         async with LivoltekClient(settings) as client:
             await client.login()
             await client.write_schedule(plan)
+
+    try:
+        await with_retries(
+            _write,
+            attempts=PORTAL_ATTEMPTS,
+            pause_s=PORTAL_RETRY_PAUSE_S,
+            what="main.portal_write",
+        )
     except Exception as exc:
         # Catch broadly: Playwright timeouts, network errors, etc. inherit from
         # Exception but NOT from LivoltekError. Without this catch they would
