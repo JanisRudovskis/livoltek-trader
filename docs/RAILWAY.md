@@ -75,7 +75,7 @@ vecajām nameplate vērtībām. `main.start` logā redzams, kas reāli stājies 
 Railway → Service → Settings → **Cron Schedule** → Custom: `0 18,19 * * *`.
 
 Palaišanas komanda **nav** jāiestata dashboard. Tā dzīvo `Dockerfile` `CMD`:
-`uv run livoltek-trader --execute --riga-hour 21`. Lauku **Custom Start Command**
+`uv run --no-sync livoltek-trader --execute --riga-hour 21`. Lauku **Custom Start Command**
 atstāj tukšu, citādi tas pārraksta Dockerfile.
 
 > `railway.json` (Railway "Config as Code") tika izņemts 2026-11-12. Railway to
@@ -109,7 +109,7 @@ izvietot ar roku: Railway → Ctrl+K → **Deploy latest commit**. Neizmanto
 
 ### 5. Dry-run (bez rakstīšanas invertorā)
 
-Īslaicīgi iestati Custom Start Command uz `uv run livoltek-trader`. Ziņa tad
+Īslaicīgi iestati Custom Start Command uz `uv run --no-sync livoltek-trader`. Ziņa tad
 nāk ar `[DRY-RUN]` prefiksu, un invertorā nekas netiek rakstīts. Pēc tam lauku
 iztukšo.
 
@@ -118,7 +118,7 @@ iztukšo.
 Railway dashboard -> Service -> Deployments -> "Run Once" — palaiž tūlīt (neatkarīgi no cron).
 **Bet** `--riga-hour 21` liek tam uzreiz beigties, ja Rīgā nav 21:xx. Manuālam
 palaidienam citā laikā īslaicīgi iestati Custom Start Command uz
-`uv run livoltek-trader --execute` (bez `--riga-hour`), pēc tam iztukšo. Noderīgs:
+`uv run --no-sync livoltek-trader --execute` (bez `--riga-hour`), pēc tam iztukšo. Noderīgs:
 - Pārbaudi pēc pirmā setup'a
 - Sūta paziņojumu pēc tava pieprasījuma
 - Testē izmaiņas

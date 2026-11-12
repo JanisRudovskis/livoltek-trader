@@ -31,5 +31,8 @@ RUN uv sync --frozen --no-dev
 # in Railway -> Service -> Settings -> Cron Schedule.
 # --riga-hour 21 makes every run outside 21:xx Riga exit at once, which also
 # makes an unscheduled start (a deploy, a stray "Run Once") harmless.
-# For a dry run, override the command with `uv run livoltek-trader`.
-CMD ["uv", "run", "livoltek-trader", "--execute", "--riga-hour", "21"]
+# --no-sync: the venv is complete after the build above. Without it, `uv run`
+# re-syncs on EVERY cron start (pulling the dev group from PyPI), so a PyPI
+# hiccup at 21:00 would kill the night's run before any ntfy could be sent.
+# For a dry run, override the command with `uv run --no-sync livoltek-trader`.
+CMD ["uv", "run", "--no-sync", "livoltek-trader", "--execute", "--riga-hour", "21"]
