@@ -25,6 +25,11 @@ COPY src/ ./src/
 COPY README.md ./
 RUN uv sync --frozen --no-dev
 
-# Default command is dry-run for safety. Flip to add `--execute` once the
-# first cron run produces sane ntfy output and you've verified the form fill.
-CMD ["uv", "run", "livoltek-trader"]
+# The production command lives HERE, versioned with the code. Railway's
+# Config as Code (railway.json) stops being read on 2026-12-01, so nothing in
+# the dashboard overrides this; only the cron schedule (0 18,19 * * *) is set
+# in Railway -> Service -> Settings -> Cron Schedule.
+# --riga-hour 21 makes every run outside 21:xx Riga exit at once, which also
+# makes an unscheduled start (a deploy, a stray "Run Once") harmless.
+# For a dry run, override the command with `uv run livoltek-trader`.
+CMD ["uv", "run", "livoltek-trader", "--execute", "--riga-hour", "21"]

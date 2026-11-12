@@ -47,7 +47,7 @@ Railway dashboard -> Service -> Variables:
 
 **Obligāti:**
 ```
-LIVOLTEK_USERNAME=Plesumu5
+LIVOLTEK_USERNAME=<portāla lietotājvārds>
 LIVOLTEK_PASSWORD=<tava parole>
 NTFY_TOPIC=livoltek-janis-7a3f9c
 ```
@@ -70,10 +70,20 @@ EV_CHARGING_EFFICIENCY=0.90
 mainīgais tās klusi pārraksta — tieši tā 2026-09-01 ražošana strādāja ar
 vecajām nameplate vērtībām. `main.start` logā redzams, kas reāli stājies spēkā.
 
-### 3. Pārliecinies par cron grafiku
+### 3. Iestati cron grafiku (Railway dashboard)
 
-`railway.json`: `"cronSchedule": "0 18,19 * * *"` un `startCommand` ar
-`--riga-hour 21`. Railway cron saprot tikai UTC, tāpēc tas palaižas divreiz:
+Railway → Service → Settings → **Cron Schedule** → Custom: `0 18,19 * * *`.
+
+Palaišanas komanda **nav** jāiestata dashboard. Tā dzīvo `Dockerfile` `CMD`:
+`uv run livoltek-trader --execute --riga-hour 21`. Lauku **Custom Start Command**
+atstāj tukšu, citādi tas pārraksta Dockerfile.
+
+> `railway.json` (Railway "Config as Code") tika izņemts 2026-11-12. Railway to
+> pārtrauc lasīt 2026-12-01, un dashboard vērtības tad paliek vienīgās. Builder
+> Railway nosaka automātiski, jo saknē ir `Dockerfile`. Cron servisiem restart
+> policy nav.
+
+Railway cron saprot tikai UTC, tāpēc tas palaižas divreiz:
 
 | | 18:00 UTC | 19:00 UTC |
 |---|---|---|
@@ -83,31 +93,32 @@ vecajām nameplate vērtībām. `main.start` logā redzams, kas reāli stājies 
 Tā grafiks tiek iestatīts 21:00 pēc Rīgas laika visu gadu, bez DST
 labojumiem. Lieko palaidienu logā redz kā `main.skip_not_scheduled_hour`.
 
-### 4. Pirmais deploy — DRY-RUN režīms
+### 4. Pārbaudi, ka izvietots tieši jaunākais commit
 
-Pēc noklusējuma `railway.json` `startCommand` ir `uv run livoltek-trader` **bez** `--execute`. Tas nozīmē:
-- Pirmais cron skrējiens dabūs PV prognozi + cenas + sastādīs plānu
-- Nosūtīs ntfy paziņojumu ar `[DRY-RUN]` prefiksu
-- **Neraksta neko reālā invertorā**
+Push uz `master` izvieto automātiski (Settings → Source: repo, zars `master`,
+"Auto deploys" ieslēgts). **Nepaļaujies uz to akli.** No 2026-09-23 līdz
+2026-11-12 push klusi neizvietojās, un produkcijā strādāja vecs kods.
 
-Pārbaudi ntfy paziņojumu pēc pirmā cron skrējiena. Ja plāns izskatās saprātīgi → pārej uz execute režīmu.
-
-### 5. Aktivē reālo režīmu
-
-Mainies `railway.json`:
-```json
-"startCommand": "uv run livoltek-trader --execute"
+Ko produkcija tiešām darbina, redzams GitHub izvietošanas ierakstā:
+```bash
+curl -s "https://api.github.com/repos/JanisRudovskis/livoltek-trader/deployments?per_page=1"
 ```
+Vēl viena pazīme ir ntfy ziņā: bez "EV uzlāde" sadaļas ir vecs kods. Ja vajag
+izvietot ar roku: Railway → Ctrl+K → **Deploy latest commit**. Neizmanto
+"Redeploy", jo tas atkārto veco commit.
 
-Commit, push, redeploy. Nākamais cron skrējiens reālā veidā ielādēs grafiku invertorā.
+### 5. Dry-run (bez rakstīšanas invertorā)
 
-Alternatīvi: Railway dashboard -> Service -> Settings -> Start Command override (bez kods izmaiņām).
+Īslaicīgi iestati Custom Start Command uz `uv run livoltek-trader`. Ziņa tad
+nāk ar `[DRY-RUN]` prefiksu, un invertorā nekas netiek rakstīts. Pēc tam lauku
+iztukšo.
 
 ### 6. Manuāli palaist starpposmā
 
 Railway dashboard -> Service -> Deployments -> "Run Once" — palaiž tūlīt (neatkarīgi no cron).
 **Bet** `--riga-hour 21` liek tam uzreiz beigties, ja Rīgā nav 21:xx. Manuālam
-palaidienam citā laikā īslaicīgi noņem `--riga-hour 21` no Start Command. Noderīgs:
+palaidienam citā laikā īslaicīgi iestati Custom Start Command uz
+`uv run livoltek-trader --execute` (bez `--riga-hour`), pēc tam iztukšo. Noderīgs:
 - Pārbaudi pēc pirmā setup'a
 - Sūta paziņojumu pēc tava pieprasījuma
 - Testē izmaiņas
@@ -139,7 +150,7 @@ Precizitāte pārbaudē uz vēstures datiem: lētāko no 7 naktīm trāpa 44 %, 
 
 Ja Railway nav vairs piemērots:
 - Dockerfile ir portable — strādās uz jebkurā Docker hosts'os (Fly.io, AWS Fargate, mājas Pi).
-- railway.json ir Railway-specific. Citur cron jāpārkonfigurē atsevišķi (Fly.io machines, k8s CronJob, crontab).
+- Cron grafiks dzīvo Railway dashboard. Citur tas jāpārkonfigurē atsevišķi (Fly.io machines, k8s CronJob, crontab). Komanda ir Dockerfile `CMD`.
 
 ## Brīdinājumi
 
