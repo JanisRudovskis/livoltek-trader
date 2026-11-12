@@ -16,6 +16,7 @@ import httpx
 
 from livoltek_trader.config import Settings, get_settings
 from livoltek_trader.ev import EvAdvice
+from livoltek_trader.nights import NightOutlook
 from livoltek_trader.solar import PvForecast
 from livoltek_trader.strategy import DailyPlan, HourlyPrice
 from livoltek_trader.telemetry import DailyTotals, format_daily_totals_line
@@ -25,6 +26,7 @@ RIGA_TZ = ZoneInfo("Europe/Riga")
 # The cron plans TOMORROW, so the day it runs on is target_date - 1. That is
 # the reference the actuals line labels itself against.
 _ONE_DAY = timedelta(days=1)
+_WEEKDAYS = ("P", "O", "T", "C", "Pk", "S", "Sv")
 
 
 class NtfyError(RuntimeError):
@@ -106,12 +108,14 @@ def format_plan_message(
     settings: Settings | None = None,
     yesterday: DailyTotals | None = None,
     ev: EvAdvice | None = None,
+    nights: list[NightOutlook] | None = None,
 ) -> tuple[str, str, list[str]]:
     """Render a daily plan as (title, body, tags) — minimal slot listing.
 
     Body shows the PV forecast, a flat list of scheduled slots (start–end +
-    strategy, Riga local time), and — when available — one line of
-    YESTERDAY'S ACTUALS. Skip days show "ToU izslēgts".
+    strategy, Riga local time), the EV windows, the nights-ahead ranking and —
+    when available — one line of YESTERDAY'S ACTUALS. Skip days show
+    "ToU izslēgts".
 
     The actuals line exists because the message used to describe only the plan
     and never the outcome. That left battery SOC in the app as the only
@@ -204,6 +208,10 @@ def format_plan_message(
                 line += " ⚠ iztukšos mājas bateriju"
             lines.append(line)
 
+    if nights:
+        lines.append("")
+        lines.extend(_nights_lines(nights))
+
     if yesterday is not None:
         lines.append("")
         # No EUR figure: an honest cost needs hourly import weighted by hourly
@@ -214,6 +222,47 @@ def format_plan_message(
         )
 
     return title, "\n".join(lines), tags
+
+
+def _night_label(night) -> str:
+    return f"{_WEEKDAYS[night.weekday()]}→{_WEEKDAYS[(night.weekday() + 1) % 7]}"
+
+
+def _nights_lines(nights: list[NightOutlook]) -> list[str]:
+    """Tonight (known) and the forecast nights, in date order, cheapest starred.
+
+    Only the order is trustworthy: the backtest picks the cheapest of seven
+    nights 44 % of the time and has it in the top two 68 % of the time, while
+    the level itself is off by 25-34 EUR/MWh. Hence `~` and the band.
+    """
+    order = sorted(range(len(nights)), key=lambda i: nights[i].eur_per_kwh)
+    marks = {order[0]: "⭐"}
+    if len(order) > 1:
+        marks[order[1]] = "☆"
+    lines = ["Naktis uz priekšu (lētākās 3 h, c/kWh):"]
+    for i, n in enumerate(nights):
+        head = f"{marks.get(i, '▫️')} {_night_label(n.night)} {n.night:%d.%m}"
+        if n.known:
+            start = n.block_start.astimezone(RIGA_TZ)
+            end = start + timedelta(hours=3)
+            lines.append(
+                f"{head} · {n.eur_per_kwh * 100:.1f} · zināma, {start:%H:%M}-{end:%H:%M}"
+            )
+        else:
+            lines.append(
+                f"{head} · ~{n.eur_per_kwh * 100:.0f} "
+                f"({n.low * 100:.0f}–{n.high * 100:.0f})"
+            )
+    best = nights[order[0]]
+    if best.known:
+        lines.append(f"Lētākā: {_night_label(best.night)} (šonakt)")
+    else:
+        verdict = f"Lētākā: {_night_label(best.night)}"
+        tonight = next((i for i, n in enumerate(nights) if n.known), None)
+        if tonight is not None:
+            verdict += f"; šonakt ir {order.index(tonight) + 1}. vietā"
+        lines.append(verdict)
+    return lines
 
 
 def format_error_message(context: str, exc: BaseException) -> tuple[str, str, int]:

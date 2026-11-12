@@ -407,3 +407,54 @@ def test_an_idle_window_starting_tonight_says_so():
     )
     _, body, _ = format_plan_message(plan)
     assert "šovakar 22:00-00:00 Stop" in body
+
+
+# --- nights ahead ---------------------------------------------------------------
+
+
+def _empty_plan() -> DailyPlan:
+    return DailyPlan(
+        target_date=date(2026, 11, 13), cycles=[], skipped_reason="x", total_net_profit_eur=0.0
+    )
+
+
+def _nights(values: list[float]):
+    from datetime import timedelta
+
+    from livoltek_trader.nights import NightOutlook
+
+    d0 = date(2026, 11, 12)  # Thursday
+    # tonight's cheapest block starts 03:00 Riga = 01:00 UTC in November
+    out = [NightOutlook(d0, values[0], block_start=datetime(2026, 11, 13, 1, 0, tzinfo=UTC))]
+    for i, v in enumerate(values[1:], 1):
+        out.append(NightOutlook(d0 + timedelta(days=i), v, v - 0.01, v + 0.03))
+    return out
+
+
+def test_nights_outlook_stars_the_cheapest_and_ranks_tonight():
+    nights = _nights([0.137, 0.15, 0.136, 0.13, 0.17, 0.16, 0.21])
+    _, body, _ = format_plan_message(_empty_plan(), nights=nights)
+    assert body.endswith(
+        "Naktis uz priekšu (lētākās 3 h, c/kWh):\n"
+        "▫️ C→Pk 12.11 · 13.7 · zināma, 03:00-06:00\n"
+        "▫️ Pk→S 13.11 · ~15 (14–18)\n"
+        "☆ S→Sv 14.11 · ~14 (13–17)\n"
+        "⭐ Sv→P 15.11 · ~13 (12–16)\n"
+        "▫️ P→O 16.11 · ~17 (16–20)\n"
+        "▫️ O→T 17.11 · ~16 (15–19)\n"
+        "▫️ T→C 18.11 · ~21 (20–24)\n"
+        "Lētākā: Sv→P; šonakt ir 3. vietā"
+    )
+
+
+def test_nights_outlook_says_when_tonight_is_cheapest():
+    nights = _nights([0.05, 0.15, 0.14, 0.13, 0.17, 0.16, 0.21])
+    _, body, _ = format_plan_message(_empty_plan(), nights=nights)
+    assert "⭐ C→Pk 12.11 · 5.0 · zināma, 03:00-06:00" in body
+    assert body.endswith("Lētākā: C→Pk (šonakt)")
+
+
+def test_no_nights_section_without_an_outlook():
+    for nights in (None, []):
+        _, body, _ = format_plan_message(_empty_plan(), nights=nights)
+        assert "Naktis" not in body

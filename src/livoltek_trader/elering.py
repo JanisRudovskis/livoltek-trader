@@ -114,3 +114,52 @@ async def fetch_day_ahead(
         )
 
     return _parse_periods(region_data)
+
+
+async def fetch_price_range(
+    first_day: date,
+    last_day: date,
+    *,
+    regions: tuple[str, ...],
+    settings: Settings | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, list[PricePeriod]]:
+    """Fetch every period from `first_day` through `last_day` (Riga dates) for
+    several bidding zones in one request — Elering returns all zones anyway.
+
+    Raises ElerinAPIError on transport/HTTP failure or when a requested region
+    is missing or empty.
+    """
+    settings = settings or get_settings()
+    params = {
+        "start": _local_day_bounds_utc(first_day)[0].strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "end": _local_day_bounds_utc(last_day)[1].strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    try:
+        if client is None:
+            async with httpx.AsyncClient(
+                base_url=settings.elering_base_url, timeout=settings.elering_timeout_s
+            ) as owned:
+                response = await owned.get("/nps/price", params=params)
+        else:
+            response = await client.get("/nps/price", params=params)
+    except httpx.HTTPError as exc:
+        raise ElerinAPIError(f"HTTP transport error: {exc}") from exc
+    if response.status_code != 200:
+        raise ElerinAPIError(
+            f"Elering returned HTTP {response.status_code}: {response.text[:200]}"
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ElerinAPIError(f"Elering returned non-JSON: {exc}") from exc
+    if not payload.get("success"):
+        raise ElerinAPIError(f"Elering signalled failure: {payload!r}")
+
+    data = payload.get("data", {})
+    out: dict[str, list[PricePeriod]] = {}
+    for region in regions:
+        if not data.get(region):
+            raise ElerinAPIError(f"No price data for {region!r} in {params}")
+        out[region] = _parse_periods(data[region])
+    return out

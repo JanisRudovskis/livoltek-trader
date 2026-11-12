@@ -102,6 +102,19 @@ def no_retry_pause(monkeypatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def no_real_nights(monkeypatch) -> list:
+    """The nights outlook calls Elering and Open-Meteo; unit tests stay offline."""
+    calls: list = []
+
+    async def fake(d0, *, settings):
+        calls.append(d0)
+        return []
+
+    monkeypatch.setattr(main_mod, "forecast_nights", fake)
+    return calls
+
+
+@pytest.fixture(autouse=True)
 def no_real_portal(monkeypatch) -> _StubPortal:
     """Applied to every test in this module: never touch the real portal."""
     stub = _StubPortal()
@@ -461,3 +474,53 @@ async def test_when_every_attempt_fails_one_alarm_lists_them(
     alarms = [m for m in stub_ntfy.sent if m[2] == 4]
     assert len(alarms) == 1
     assert alarms[0][1].count("DeviceListEmptyError") == main_mod.PORTAL_ATTEMPTS
+
+
+# --- nights-ahead outlook -------------------------------------------------------
+
+
+async def test_message_carries_the_nights_outlook_from_the_run_evening(
+    monkeypatch, args, settings, stub_ntfy
+):
+    from livoltek_trader.nights import NightOutlook
+
+    seen = []
+
+    async def nights(d0, *, settings):
+        seen.append(d0)
+        return [
+            NightOutlook(d0, 0.05, block_start=datetime(2026, 12, 15, 1, tzinfo=UTC)),
+            NightOutlook(d0 + timedelta(days=1), 0.09, 0.07, 0.12),
+        ]
+
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", _pv_ok())
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    monkeypatch.setattr(main_mod, "forecast_nights", nights)
+
+    assert await main_mod._run(args, settings) == 0
+    assert seen == [date(2026, 12, 14)], "the run evening is the day before the target"
+    assert "Naktis uz priekšu" in stub_ntfy.sent[0][1]
+
+
+async def test_a_failed_nights_outlook_does_not_cost_the_run(
+    monkeypatch, args, settings, stub_ntfy
+):
+    import structlog
+
+    async def boom(d0, *, settings):
+        raise RuntimeError("open-meteo down")
+
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", _pv_ok())
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    monkeypatch.setattr(main_mod, "forecast_nights", boom)
+
+    with structlog.testing.capture_logs() as logs:
+        assert await main_mod._run(args, settings) == 0
+    assert stub_ntfy.sent and "Naktis" not in stub_ntfy.sent[0][1]
+    assert any(e["event"] == "main.nights_forecast_failed" for e in logs)

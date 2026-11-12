@@ -17,6 +17,7 @@ from livoltek_trader.elering import (
     _local_day_bounds_utc,
     _parse_periods,
     fetch_day_ahead,
+    fetch_price_range,
 )
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "elering_full_day.json"
@@ -138,3 +139,34 @@ async def test_fetch_day_ahead_malformed_json(settings):
     )
     with pytest.raises(ElerinAPIError, match="non-JSON"):
         await fetch_day_ahead(date(2026, 5, 9), settings=settings)
+
+
+@respx.mock
+async def test_fetch_price_range_returns_each_requested_region(settings):
+    """One request covers a span of Riga days; the nights outlook needs LV and FI."""
+    t = int(datetime(2026, 11, 5, 22, 0, tzinfo=timezone.utc).timestamp())
+    route = respx.get("https://dashboard.elering.ee/api/nps/price").mock(
+        return_value=httpx.Response(200, json={"success": True, "data": {
+            "lv": [{"timestamp": t, "price": 120.0}],
+            "fi": [{"timestamp": t, "price": 20.0}],
+            "ee": [{"timestamp": t, "price": 99.0}],
+        }})
+    )
+    out = await fetch_price_range(
+        date(2026, 11, 6), date(2026, 11, 13), regions=("lv", "fi"), settings=settings
+    )
+    params = route.calls.last.request.url.params
+    assert params["start"] == "2026-11-05T22:00:00Z"
+    assert params["end"] == "2026-11-13T21:59:59Z"
+    assert set(out) == {"lv", "fi"}
+    assert out["lv"][0].eur_per_kwh == pytest.approx(0.12)
+    assert out["fi"][0].eur_per_kwh == pytest.approx(0.02)
+
+
+@respx.mock
+async def test_fetch_price_range_raises_when_a_region_is_missing(settings):
+    respx.get("https://dashboard.elering.ee/api/nps/price").mock(
+        return_value=httpx.Response(200, json={"success": True, "data": {"lv": [{"timestamp": 0, "price": 1.0}]}})
+    )
+    with pytest.raises(ElerinAPIError, match="fi"):
+        await fetch_price_range(date(2026, 11, 6), date(2026, 11, 13), regions=("lv", "fi"), settings=settings)

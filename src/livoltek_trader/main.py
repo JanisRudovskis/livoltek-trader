@@ -30,6 +30,7 @@ RIGA_TZ = ZoneInfo("Europe/Riga")
 from livoltek_trader.config import Settings, get_settings
 from livoltek_trader.elering import ElerinAPIError, fetch_day_ahead
 from livoltek_trader.ev import advise_ev
+from livoltek_trader.nights import NightOutlook, forecast_nights
 from livoltek_trader.livoltek import LivoltekClient, with_retries
 from livoltek_trader.notify import (
     NtfyClient,
@@ -251,6 +252,26 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         ),
     )
 
+    # Which coming night is cheapest for the car. Advisory only: any failure
+    # (Elering, Open-Meteo, the model file) drops the section, never the run.
+    nights: list[NightOutlook] = []
+    try:
+        nights = await forecast_nights(target_date - timedelta(days=1), settings=settings)
+    except Exception as exc:  # noqa: BLE001 — optional extra, keep the night's schedule
+        log.warning(
+            "main.nights_forecast_failed",
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
+    if nights:
+        cheapest = min(nights, key=lambda n: n.eur_per_kwh)
+        log.info(
+            "main.nights_ready",
+            nights=len(nights),
+            cheapest=cheapest.night.isoformat(),
+            cheapest_known=cheapest.known,
+        )
+
     title, body, tags = format_plan_message(
         plan,
         pv_forecast=pv,
@@ -258,6 +279,7 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         settings=settings,
         yesterday=latest,
         ev=ev,
+        nights=nights,
     )
     if not args.execute:
         title = f"[DRY-RUN] {title}"

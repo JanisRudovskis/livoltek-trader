@@ -153,6 +153,12 @@ class Settings(BaseSettings):
     pv_kwh_per_mj_m2: float = Field(default=2.98, gt=0.0)
     expected_daily_load_kwh: float = Field(default=22.0, gt=0.0)
     open_meteo_timeout_s: float = Field(default=15.0)
+    open_meteo_previous_runs_url: str = Field(
+        default="https://previous-runs-api.open-meteo.com/v1"
+    )
+    """Archived forecasts at fixed 1-7 day lead offsets. The nights outlook
+    reads its weather from here so that live features match the training
+    data exactly (see `nights.py`)."""
 
     ev_charge_hours: int = Field(default=3, ge=0, le=12)
     """Length of the EV charging window the nightly message recommends.

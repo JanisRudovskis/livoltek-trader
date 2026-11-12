@@ -12,7 +12,9 @@ Railway cron (18:00 un 19:00 UTC; strādā tikai tas, kas Rīgā ir 21:xx)
       → fetch Open-Meteo PV forecast
       → fetch Elering Nord Pool prices (rītdiena + šovakars EV logam)
       → plan_day → DailyPlan → advise_ev (EV logi + mājas baterijas turēšana)
-      → ntfy notification (plāns + EV logi + 100 km cena)
+      → forecast_nights (šonakt + 6 naktis; Elering vēsture + Open-Meteo
+           Previous Runs vēja/temperatūras prognozes; kļūda → sadaļa izpaliek)
+      → ntfy notification (plāns + EV logi + 100 km cena + naktis uz priekšu)
       → IF --execute: Playwright login + write_schedule
            (ToU off → visi 6 sloti kā reģistri → ToU on; katrs solis
             nolasīts atpakaļ no invertora, neapstiprināts → ntfy trauksme)
@@ -118,6 +120,20 @@ palaidienam citā laikā īslaicīgi noņem `--riga-hour 21` no Start Command. N
 - [ ] Login bieži notiek bez problēmām (popup pareizi atrisina)
 
 Ja viss ok → aktivē `--execute`.
+
+## Nakšu prognozes modelis
+
+Sadaļa "Naktis uz priekšu" sarindo nākamās naktis pēc prognozētā lētāko 3 h bloka cenas. Koeficienti glabājas `src/livoltek_trader/night_model.json`.
+
+Pārtrenē reizi mēnesī vai tad, kad tirgus būtiski mainās:
+
+```bash
+uv run --with numpy python scripts/train_night_model.py
+```
+
+Skripts tikai lasa publiskos API (Elering un Open-Meteo). Pēc tam iecommito atjaunoto JSON. Uz servera numpy nav vajadzīgs, jo prognoze ir tīrs Python.
+
+Precizitāte pārbaudē uz vēstures datiem: lētāko no 7 naktīm trāpa 44 %, divās labākajās tā ir 68 % gadījumu. Cenu līmenis ir aptuvens, kļūda ir 25–34 €/MWh. Tāpēc ziņā ir `~` un diapazons.
 
 ## Pārvietot uz citu hosting
 
