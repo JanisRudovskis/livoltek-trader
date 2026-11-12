@@ -11,6 +11,7 @@ from livoltek_trader.strategy import CyclePair, DailyPlan, TradingWindow
 from livoltek_trader.tou import (
     CMD_CHARGE,
     CMD_DISCHARGE,
+    CMD_STOP,
     INERT_SLOT,
     SLOT_COUNT,
     TOU_ADDR,
@@ -44,13 +45,14 @@ def _cycle(d: date, h0: int, h1: int, hold_until: datetime | None = None) -> Cyc
     )
 
 
-def _plan(cycles=(), stop_window=None, d: date = FRI) -> DailyPlan:
+def _plan(cycles=(), stop_window=None, d: date = FRI, idle=()) -> DailyPlan:
     return DailyPlan(
         target_date=d,
         cycles=list(cycles),
         skipped_reason=None if cycles or stop_window else "nothing",
         total_net_profit_eur=0.0,
         stop_window=stop_window,
+        idle_windows=list(idle),
     )
 
 
@@ -184,3 +186,24 @@ def test_slots_already_correct_but_tou_off_only_switches_tou_on():
     assert write_steps(slots, tou_on=True, device=_device(TOU_OFF, slots)) == [
         {TOU_ADDR: TOU_ON}
     ]
+
+
+# --- battery-idle (Stop) windows for the EV -----------------------------------------
+
+
+def test_a_plan_with_only_idle_windows_still_needs_tou_on():
+    assert not _plan(idle=[_w(FRI, 1, 4)]).is_empty
+
+
+def test_idle_window_becomes_a_stop_slot_on_its_own_weekday():
+    thu = FRI - timedelta(days=1)
+    tonight = TradingWindow(
+        start=datetime.combine(thu, time(22), tzinfo=RIGA),
+        end=datetime.combine(FRI, time(0), tzinfo=RIGA),
+        avg_eur_per_kwh=0.05,
+    )
+    slots = slots_for_plan(_plan(idle=[tonight, _w(FRI, 0, 3)]), discharge_soc_pct=15)
+    # Tonight's part belongs to Thursday and runs to the last minute of it;
+    # 00:00 cannot be written as an end time.
+    assert slots[0] == Slot(CMD_STOP, 10.0, 100, time(22, 0), time(23, 59), days=8)
+    assert slots[1] == Slot(CMD_STOP, 10.0, 100, time(0, 0), time(3, 0), days=16)

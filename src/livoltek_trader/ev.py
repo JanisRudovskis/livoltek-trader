@@ -151,8 +151,9 @@ def advise_ev(
     settings: Settings,
     displaceable_kwh: float | None = None,
 ) -> EvAdvice:
-    """Cheapest night and day car windows, and the plan with a battery hold
-    across the recommended one when that pays.
+    """Cheapest night and day car windows, and the plan with the battery
+    protected across the recommended one: the house Charge slot held over it
+    when that pays, and Stop over its remaining sunless hours.
 
     `hourly` should cover the evening before the target day as well as the
     day itself, so tonight's hours can be offered.
@@ -180,15 +181,75 @@ def advise_ev(
 
     price = {h.start: h.eur_per_kwh for h in hourly}
     plan = _hold(plan, options[best].window, price, settings, displaceable_kwh)
+    if settings.ev_protect_battery:
+        idle = _idle_windows(plan, options[best].window, settings)
+        if idle:
+            plan = plan.model_copy(update={"idle_windows": idle})
     options = [
-        o.model_copy(
-            update={
-                "drains_battery": any(
-                    _overlaps((o.window.start, o.window.end), _full_span(c))
-                    for c in plan.cycles
-                )
-            }
-        )
+        o.model_copy(update={"drains_battery": _exposed(plan, o.window)})
         for o in options
     ]
     return EvAdvice(options=options, best=best, plan=plan)
+
+
+def _sunless(hour_start: datetime, settings: Settings) -> bool:
+    h = hour_start.astimezone(RIGA_TZ).hour
+    return (
+        h < settings.stop_pv_window_start_hour_riga
+        or h >= settings.stop_pv_window_end_hour_riga
+    )
+
+
+def _busy_spans(plan: DailyPlan) -> list[tuple[datetime, datetime]]:
+    """Spans already owned by another slot; a Stop must not overlap them."""
+    spans = [(c.charge.start, c.hold_until or c.charge.end) for c in plan.cycles]
+    if plan.stop_window is not None:
+        spans.append((plan.stop_window.start, plan.stop_window.end))
+    return spans
+
+
+def _idle_windows(
+    plan: DailyPlan, ev: TradingWindow, settings: Settings
+) -> list[TradingWindow]:
+    """The recommended EV window's sunless hours that no other slot covers,
+    merged into runs and split at midnight (a slot lives on one weekday)."""
+    busy = _busy_spans(plan)
+    hours = []
+    h = ev.start
+    while h < ev.end:
+        span = (h, h + timedelta(hours=1))
+        if _sunless(h, settings) and not any(_overlaps(span, b) for b in busy):
+            hours.append(h)
+        h += timedelta(hours=1)
+    runs: list[list[datetime]] = []
+    for h in hours:
+        same_run = (
+            runs
+            and runs[-1][-1] + timedelta(hours=1) == h
+            and h.astimezone(RIGA_TZ).hour != 0  # midnight starts a new slot
+        )
+        if same_run:
+            runs[-1].append(h)
+        else:
+            runs.append([h])
+    return [
+        TradingWindow(
+            start=r[0],
+            end=r[-1] + timedelta(hours=1),
+            avg_eur_per_kwh=ev.avg_eur_per_kwh,
+        )
+        for r in runs
+    ]
+
+
+def _exposed(plan: DailyPlan, window: TradingWindow) -> bool:
+    """Would a car charging in `window` draw on a battery the plan filled?"""
+    for c in plan.cycles:
+        start, end = _full_span(c)
+        h = max(start, window.start)
+        while h < min(end, window.end):
+            hour = (h, h + timedelta(hours=1))
+            if not any(_overlaps(hour, (w.start, w.end)) for w in plan.idle_windows):
+                return True
+            h += timedelta(hours=1)
+    return False

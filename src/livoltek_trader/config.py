@@ -161,6 +161,10 @@ class Settings(BaseSettings):
     the portal's load data), so 3 h is ~33 kWh — about the median session
     seen in Oct-Nov 2026. 0 turns EV advice and the battery hold off.
     """
+    ev_protect_battery: bool = Field(default=True)
+    """Hold the battery idle (inverter Stop) across the sunless hours of the
+    recommended EV window, so the car cannot drain it. Kill switch in case
+    Stop ever misbehaves on this inverter."""
     ev_consumption_kwh_per_100km: float = Field(default=20.0, gt=0.0)
     """Cupra Tavascan VZ 4Drive. Published figures are 16-18.5 kWh/100km in
     mild weather; 20 is a winter-leaning estimate. Replace with the car's own

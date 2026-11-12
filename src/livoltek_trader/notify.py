@@ -131,9 +131,12 @@ def format_plan_message(
         settings.morning_discharge_target_soc_pct if settings is not None else 15
     )
 
-    if not has_stop and not has_cycles:
+    if plan.is_empty:
         title = f"Livoltek {plan.target_date}: ToU izslēgts"
         tags = ["sunny"]
+    elif not has_stop and not has_cycles:
+        title = f"Livoltek {plan.target_date}: baterija stāv EV laikā"
+        tags = ["car"]
     elif has_stop and not has_cycles:
         title = f"Livoltek {plan.target_date}: Discharge {morning_soc}%"
         tags = ["sunny"]
@@ -155,7 +158,7 @@ def format_plan_message(
         lines.append(f"PV: {pv_forecast.expected_kwh:.1f} kWh")
         lines.append("")
 
-    if not has_stop and not has_cycles:
+    if plan.is_empty:
         lines.append("ToU izslēgts")
     else:
         if has_stop:
@@ -174,6 +177,13 @@ def format_plan_message(
                 lines.append(
                     f"{_fmt_local(c.charge.start)}-{_fmt_local(c.charge.end)} Charge 100%"
                 )
+        for w in plan.idle_windows:
+            tonight = w.start.astimezone(RIGA_TZ).date() < plan.target_date
+            lines.append(
+                f"{'šovakar ' if tonight else ''}"
+                f"{_fmt_local(w.start)}-{_fmt_local(w.end)} Stop "
+                f"(baterija stāv, lai EV to neiztērē)"
+            )
 
     if ev is not None and ev.options:
         lines.append("")

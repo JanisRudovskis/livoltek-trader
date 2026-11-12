@@ -154,8 +154,72 @@ def test_ev_window_before_the_house_charge_needs_no_hold(settings):
     assert [(c.charge.start.hour, c.charge.end.hour) for c in plan.cycles] == [(12, 14)]
     advice = advise_ev(plan, hourly, settings)
     assert advice.options[advice.best].window.start == _at(FRI, 0)
-    assert advice.plan == plan
+    assert advice.plan.cycles == plan.cycles
     assert not any(o.drains_battery for o in advice.options)
+
+
+# --- Stop over the recommended window's sunless hours ----------------------------------
+#
+# Whatever the battery holds at night (PV left over, an earlier charge), an
+# 11 kW car would take it at the cheapest prices of the day. Stop keeps it
+# idle; the house runs from the grid at those same cheap prices. Only in
+# sunless hours, where PV routing cannot matter.
+
+
+def _windows(plan):
+    return [(w.start, w.end) for w in plan.idle_windows]
+
+
+def test_battery_is_idled_across_a_night_ev_window(settings):
+    prices = [0.03] * 3 + [0.07] * 9 + [0.04, 0.04] + [0.30] * 10
+    plan, hourly = _scenario(settings, prices)
+    advice = advise_ev(plan, hourly, settings)
+    assert _windows(advice.plan) == [(_at(FRI, 0), _at(FRI, 3))]
+
+
+def test_idle_window_is_split_at_midnight(settings):
+    # Tonight 22-24 and 00-01 are the cheapest night hours; the day is too
+    # flat for a house charge, so nothing else claims those hours.
+    prices = [0.02] + [0.05] * 23
+    plan, hourly = _scenario(settings, prices, tonight=(0.25, 0.02, 0.02))
+    advice = advise_ev(plan, hourly, settings)
+    best = advice.options[advice.best]
+    assert (best.window.start, best.window.end) == (
+        _at(FRI - timedelta(days=1), 22), _at(FRI, 1),
+    )
+    assert _windows(advice.plan) == [
+        (_at(FRI - timedelta(days=1), 22), _at(FRI, 0)),
+        (_at(FRI, 0), _at(FRI, 1)),
+    ]
+
+
+def test_no_stop_in_daylight_hours(settings):
+    """A daytime Stop would turn away the PV the battery should be storing."""
+    prices = [0.20] * 12 + [0.01, 0.01, 0.01] + [0.20] * 9
+    plan, hourly = _scenario(settings, prices)
+    advice = advise_ev(plan, hourly, settings)
+    assert advice.options[advice.best].label == "diena"
+    assert advice.plan.idle_windows == []
+
+
+def test_stop_never_overlaps_a_house_charge_slot(settings):
+    """EV cheapest 02-05, house charges 04-06: the Stop stops where the
+    Charge begins — two slots must never cover the same minute."""
+    prices = [0.20, 0.20, 0.01, 0.01, 0.02, 0.03] + [0.35] * 18
+    plan, hourly = _scenario(settings, prices)
+    charge = plan.cycles[0].charge
+    advice = advise_ev(plan, hourly, settings)
+    best = advice.options[advice.best].window
+    assert best.start < charge.start < best.end  # the scenario does overlap
+    for s, e in _windows(advice.plan):
+        assert e <= charge.start or s >= (advice.plan.cycles[0].hold_until or charge.end)
+
+
+def test_battery_protection_can_be_switched_off(settings):
+    prices = [0.03] * 3 + [0.07] * 9 + [0.04, 0.04] + [0.30] * 10
+    plan, hourly = _scenario(settings, prices)
+    off = settings.model_copy(update={"ev_protect_battery": False})
+    assert advise_ev(plan, hourly, off).plan.idle_windows == []
 
 
 def test_cheapest_block_sorts_and_dedupes_its_input():

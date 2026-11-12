@@ -368,3 +368,42 @@ def test_no_ev_section_without_advice():
     advice = _ev_advice(hold=False, drains_day=False)
     _, body, _ = format_plan_message(advice.plan)
     assert "EV" not in body
+
+
+def test_idle_windows_are_listed_and_keep_tou_on_in_the_title():
+    plan = DailyPlan(
+        target_date=date(2026, 5, 9),
+        cycles=[],
+        skipped_reason="no cycle nets at least 0.25 EUR",
+        total_net_profit_eur=0.0,
+        # UTC 22:00-02:00 -> Riga 01:00-05:00 in May
+        idle_windows=[
+            TradingWindow(
+                start=datetime(2026, 5, 8, 22, 0, tzinfo=UTC),
+                end=datetime(2026, 5, 9, 2, 0, tzinfo=UTC),
+                avg_eur_per_kwh=0.03,
+            )
+        ],
+    )
+    title, body, _ = format_plan_message(plan)
+    assert "ToU izslēgts" not in title and "ToU izslēgts" not in body
+    assert "01:00-05:00 Stop" in body
+
+
+def test_an_idle_window_starting_tonight_says_so():
+    plan = DailyPlan(
+        target_date=date(2026, 5, 9),
+        cycles=[],
+        skipped_reason=None,
+        total_net_profit_eur=0.0,
+        # UTC 19:00-21:00 on the 8th -> Riga 22:00-24:00, the evening before
+        idle_windows=[
+            TradingWindow(
+                start=datetime(2026, 5, 8, 19, 0, tzinfo=UTC),
+                end=datetime(2026, 5, 8, 21, 0, tzinfo=UTC),
+                avg_eur_per_kwh=0.03,
+            )
+        ],
+    )
+    _, body, _ = format_plan_message(plan)
+    assert "šovakar 22:00-00:00 Stop" in body

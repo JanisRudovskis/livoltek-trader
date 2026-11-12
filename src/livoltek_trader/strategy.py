@@ -106,11 +106,17 @@ class DailyPlan(BaseModel):
     skipped_reason: str | None
     total_net_profit_eur: float
     stop_window: TradingWindow | None = None
+    idle_windows: list[TradingWindow] = []
+    """Hours the battery is held idle (inverter `Stop`) so an EV charging
+    then cannot drain it — see `ev.advise_ev`. Unlike `stop_window`, which is
+    a morning Discharge-to-grid slot despite its name."""
 
     @property
     def is_empty(self) -> bool:
-        """True when neither a cycle nor a Stop window is planned — ToU off."""
-        return not self.cycles and self.stop_window is None
+        """True when nothing is scheduled at all — ToU off."""
+        return (
+            not self.cycles and self.stop_window is None and not self.idle_windows
+        )
 
 
 def aggregate_hourly(periods: Iterable[PricePeriod]) -> list[HourlyPrice]:

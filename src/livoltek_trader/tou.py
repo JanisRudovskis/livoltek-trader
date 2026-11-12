@@ -84,6 +84,14 @@ def _local_time(dt: datetime) -> time:
 def _slot(command: int, soc_pct: int, start: datetime, end: datetime, days: int) -> Slot:
     s = _local_time(start)
     e = _local_time(end)
+    if (
+        e == time(0, 0)
+        and end.astimezone(RIGA_TZ).date() > start.astimezone(RIGA_TZ).date()
+        and command == CMD_STOP
+    ):
+        # A battery-idle window reaching midnight: run to the day's last
+        # minute; the part after midnight is its own slot on the next weekday.
+        e = time(23, 59)
     if e == time(0, 0) or e <= s:
         # A slot ending at midnight cannot be expressed: 00:00 as an end reads
         # as zero-length or wrapping on the device. The planner never produces
@@ -106,6 +114,11 @@ def slots_for_plan(plan: DailyPlan, *, discharge_soc_pct: int) -> list[Slot]:
     for c in sorted(plan.cycles, key=lambda c: c.charge.start):
         end = c.hold_until or c.charge.end
         slots.append(_slot(CMD_CHARGE, 100, c.charge.start, end, days))
+    for w in sorted(plan.idle_windows, key=lambda w: w.start):
+        # Each idle window carries its own weekday: tonight's part of an EV
+        # window belongs to the day the schedule is written, not the target.
+        own_day = day_bit(w.start.astimezone(RIGA_TZ).date())
+        slots.append(_slot(CMD_STOP, 100, w.start, w.end, own_day))
     if len(slots) > SLOT_COUNT:
         raise ValueError(f"{len(slots)} slots planned, the inverter has {SLOT_COUNT}")
     return slots + [INERT_SLOT] * (SLOT_COUNT - len(slots))
