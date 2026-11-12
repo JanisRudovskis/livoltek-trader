@@ -154,6 +154,21 @@ class Settings(BaseSettings):
     expected_daily_load_kwh: float = Field(default=22.0, gt=0.0)
     open_meteo_timeout_s: float = Field(default=15.0)
 
+    ev_charge_hours: int = Field(default=3, ge=0, le=12)
+    """Length of the EV charging window the nightly message recommends.
+
+    The charger draws ~11 kW (three-phase, visible as the 10-12 kW cluster in
+    the portal's load data), so 3 h is ~33 kWh — about the median session
+    seen in Oct-Nov 2026. 0 turns EV advice and the battery hold off.
+    """
+    ev_consumption_kwh_per_100km: float = Field(default=20.0, gt=0.0)
+    """Cupra Tavascan VZ 4Drive. Published figures are 16-18.5 kWh/100km in
+    mild weather; 20 is a winter-leaning estimate. Replace with the car's own
+    long-run average from its trip computer."""
+    ev_charging_efficiency: float = Field(default=0.90, gt=0.0, le=1.0)
+    """Grid kWh into the car per kWh the car reports using. Typical for
+    11 kW AC charging."""
+
     ntfy_base_url: str = Field(default="https://ntfy.sh")
     ntfy_topic: str = Field(default="")
     ntfy_token: str = Field(default="")

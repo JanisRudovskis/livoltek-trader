@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from livoltek_trader.config import Settings, get_settings
+from livoltek_trader.ev import EvAdvice
 from livoltek_trader.solar import PvForecast
 from livoltek_trader.strategy import DailyPlan, HourlyPrice
 from livoltek_trader.telemetry import DailyTotals, format_daily_totals_line
@@ -104,6 +105,7 @@ def format_plan_message(
     hourly_prices: list[HourlyPrice] | None = None,
     settings: Settings | None = None,
     yesterday: DailyTotals | None = None,
+    ev: EvAdvice | None = None,
 ) -> tuple[str, str, list[str]]:
     """Render a daily plan as (title, body, tags) — minimal slot listing.
 
@@ -162,9 +164,35 @@ def format_plan_message(
                 f"{_fmt_local(sw.start)}-{_fmt_local(sw.end)} Discharge {morning_soc}%"
             )
         for c in plan.cycles:
-            lines.append(
-                f"{_fmt_local(c.charge.start)}-{_fmt_local(c.charge.end)} Charge 100%"
+            if c.hold_until is not None:
+                lines.append(
+                    f"{_fmt_local(c.charge.start)}-{_fmt_local(c.hold_until)} "
+                    f"Charge 100% (pilna no {_fmt_local(c.charge.end)}, "
+                    f"tur pilnu EV dēļ)"
+                )
+            else:
+                lines.append(
+                    f"{_fmt_local(c.charge.start)}-{_fmt_local(c.charge.end)} Charge 100%"
+                )
+
+    if ev is not None and ev.options:
+        lines.append("")
+        hours = int(
+            (ev.options[0].window.end - ev.options[0].window.start).total_seconds()
+            // 3600
+        )
+        lines.append(f"EV uzlāde ({hours} h):")
+        for i, o in enumerate(ev.options):
+            mark = "⭐" if i == ev.best else "  "
+            line = (
+                f"{mark} {o.label} {_fmt_local(o.window.start)}-"
+                f"{_fmt_local(o.window.end)} · "
+                f"{o.window.avg_eur_per_kwh * 100:.1f} c/kWh · "
+                f"100 km €{o.cost_100km_eur:.2f}"
             )
+            if o.drains_battery:
+                line += " ⚠ iztukšos mājas bateriju"
+            lines.append(line)
 
     if yesterday is not None:
         lines.append("")

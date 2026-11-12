@@ -5,8 +5,10 @@ Deep URL navigation does not work — every entry must traverse from the
 Homepage forward (Site card → Device card → tab → sub-tab). Cookie/session
 state is persisted to disk so we don't burn a fresh login every day.
 
-Steps 6–7 of the build plan: log in, navigate to Params set → System mode,
-and write the daily schedule (toggle ToU + fill 1-6 Charge slots, then Save).
+Log in, navigate, read history, and write the daily schedule. The schedule
+is written as device registers through the portal's own parameter API and
+confirmed by reading them back — not by filling the System-mode form, which
+sent only a diff and left "cleared" slots live on the inverter (see `tou`).
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import calendar
 import json
+from typing import Awaitable, Callable, Protocol
 from contextlib import AsyncExitStack
 from datetime import date
 from pathlib import Path
@@ -30,37 +33,120 @@ from playwright.async_api import (
 )
 
 from livoltek_trader.config import Settings, get_settings
-from livoltek_trader.strategy import CyclePair, DailyPlan, TradingWindow
+from livoltek_trader.strategy import DailyPlan
 from livoltek_trader.telemetry import DailyTotals, parse_daily_rows
+from livoltek_trader.tou import pending, slots_for_plan, write_steps
 
 RIGA_TZ = ZoneInfo("Europe/Riga")
-
-_WEEKDAY_LABELS = ["Mon.", "Tue.", "Wed.", "Thu.", "Fri.", "Sat.", "Sun."]
-"""Element UI weekday picker labels, in Python isoweekday order (Mon=0)."""
 
 log = structlog.get_logger(__name__)
 
 
-def _needs_save(plan: DailyPlan, *, tou_changed: bool) -> bool:
-    """Whether `Save Params.` has anything to commit.
-
-    A non-empty plan always rewrites slot rows, so it always needs saving. An
-    empty plan only touches the ToU toggle — and if the toggle was already in
-    the desired state, the form is byte-identical to what the inverter just
-    reported and there is nothing to issue.
-
-    Clicking Save anyway is not harmless: the portal returns no success toast
-    (it has no command to send), so `_verify_save_toast` warned
-    `livoltek.save.no_success_toast_seen` on every such night. Through summer,
-    when the PV gate empties most plans, that is a daily false alarm — and a
-    warning that cries wolf daily is a warning nobody reads on the night Save
-    genuinely fails.
-    """
-    return (not plan.is_empty) or tou_changed
-
-
 class LivoltekError(RuntimeError):
-    """Raised on login or navigation failure."""
+    """Raised on login, navigation or schedule-write failure."""
+
+
+class PortalBusyError(LivoltekError):
+    """The portal refused a command because the previous one was too recent.
+
+    It answers `POINT_REPEAT_CONTROL_IN_SHORT_TIME` to a command sent within
+    roughly 10 s of the last one (measured 2026-11-12: refused ~5 s after,
+    accepted 11 s after). Transient: wait and send again.
+    """
+
+
+class PointApi(Protocol):
+    """The portal's device-parameter endpoints, as the write loop needs them."""
+
+    async def read(self) -> dict[int, dict]:
+        """Device point definitions with current values, keyed by address."""
+
+    async def write(self, points: list[dict]) -> None:
+        """Issue register writes; returns once the portal has queued them."""
+
+
+REGISTER_POLL_S = 5.0
+"""How often the device is re-read while a write lands. Measured 2026-11-12:
+registers are applied one at a time, about 5-20 s apart."""
+
+BUSY_RETRY_S = 15.0
+BUSY_RETRIES = 20
+"""A refused-as-too-soon write is retried every 15 s for up to 5 minutes."""
+
+
+def points_by_address(payload) -> dict[int, dict]:
+    """Every point object in a `point/info` response, keyed by register address.
+
+    The response nests points in groups; only the objects matter, so walk the
+    whole structure rather than pinning its shape.
+    """
+    found: dict[int, dict] = {}
+
+    def walk(node) -> None:
+        if isinstance(node, dict):
+            address = node.get("address")
+            if "pointName" in node and str(address or "").isdigit():
+                found.setdefault(int(address), node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    walk(payload)
+    return found
+
+
+async def apply_register_steps(
+    api: PointApi,
+    steps: list[dict[int, int | str]],
+    *,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    max_polls: int | None = None,
+) -> None:
+    """Write each step and wait until the DEVICE reports it, then the next.
+
+    The portal's "issued successfully" only means it queued the command. On
+    2026-11-05 part of a write never reached the inverter and nothing noticed,
+    so success is now defined as reading the values back. If a step is not
+    confirmed the sequence stops: later steps (ToU on) are never sent, which
+    leaves the inverter in plain Self-use rather than half-programmed.
+    """
+    for step in steps:
+        definitions = await api.read()
+        unknown = sorted(a for a in step if a not in definitions)
+        if unknown:
+            raise LivoltekError(
+                f"registers {unknown} are not in the device point list; "
+                f"the portal register map changed"
+            )
+        points = [{**definitions[a], "value": value} for a, value in step.items()]
+        for attempt in range(BUSY_RETRIES):
+            try:
+                await api.write(points)
+                break
+            except PortalBusyError:
+                log.info("livoltek.registers.portal_busy_retry", attempt=attempt + 1)
+                await sleep(BUSY_RETRY_S)
+        else:
+            raise LivoltekError(
+                f"portal stayed busy (refused as too soon) for "
+                f"{BUSY_RETRIES} attempts; schedule write stopped"
+            )
+        polls = max_polls or (12 + 3 * len(step))
+        left = dict(step)
+        for _ in range(polls):
+            await sleep(REGISTER_POLL_S)
+            current = await api.read()
+            left = pending(step, {a: p.get("value") for a, p in current.items()})
+            if not left:
+                break
+        else:
+            raise LivoltekError(
+                f"inverter did not confirm registers {sorted(left)} after "
+                f"{polls} reads; schedule write stopped"
+            )
+        log.info("livoltek.registers.confirmed", count=len(step))
 
 
 class LivoltekClient:
@@ -70,6 +156,7 @@ class LivoltekClient:
     STATION_URL_FRAGMENT = "/customer/tocStation/"
     DEVICE_URL_FRAGMENT = "/customer/tocDevice/"
     EU_HOST = "evs.livoltek-portal.com"
+    OPERATION_PATH = "/hess-ota/device/operation"
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
@@ -493,301 +580,94 @@ class LivoltekClient:
             err.__cause__ = cause
         return err
 
-    async def apply_schedule(self, plan: DailyPlan, *, save: bool = False) -> None:
-        """Write the day's plan to the System mode form.
+    async def write_schedule(self, plan: DailyPlan) -> None:
+        """Program the inverter's six ToU slots for `plan`, confirmed on the device.
 
-        Behaviour:
-        - If `plan.is_empty` (no cycles AND no Stop window), disable
-          Enable ToU schedule — inverter falls back to pure Self-use mode.
-        - Otherwise, enable ToU and fill slots in this order:
-            slot 0: Stop window (if present)
-            next:   Charge cycles (in time order)
-            last:   `Without a strategy` for unused slots
-          All slots fire on today's weekday only.
-
-        With `save=False` (default), the form is filled but `Save Params.`
-        is NOT clicked — values stay local to the browser session and are
-        lost on page reload. Use `save=True` to commit to the inverter.
+        Navigates to System mode only so the SPA issues a device-parameter
+        request, from which the authorization header and device id are taken.
+        The schedule itself is written as registers (see `tou`), with ToU off
+        while slots change, and every step read back from the device.
         """
         page = self.page
-        if plan.is_empty:
-            tou_changed = await self._set_tou_enabled(False)
-            log.info("livoltek.apply_schedule.skip_day", reason=plan.skipped_reason)
-        else:
-            tou_changed = await self._set_tou_enabled(True)
-            # Use the PLAN's weekday, not "now". The cron runs the evening
-            # before the trading day, so `datetime.now().weekday()` would
-            # be off by one and the slot would fire today instead of
-            # tomorrow.
-            target_weekday = _WEEKDAY_LABELS[plan.target_date.weekday()]
+        captured: dict = {}
 
-            slot_idx = 0
-            if plan.stop_window is not None:
-                await self._fill_stop_slot(
-                    slot_idx, plan.stop_window, target_weekday
-                )
-                slot_idx += 1
+        def on_request(request) -> None:
+            if self.OPERATION_PATH not in request.url or "headers" in captured:
+                return
+            try:
+                device_id = json.loads(request.post_data or "{}").get("id")
+            except (ValueError, TypeError, AttributeError):
+                return
+            if device_id is None:
+                return
+            captured["device_id"] = device_id
+            captured["headers"] = {
+                k: v
+                for k, v in (request.headers or {}).items()
+                if k.lower() not in ("host", "content-length", "connection")
+            }
 
-            for cycle in plan.cycles:
-                if slot_idx >= 6:
+        page.on("request", on_request)
+        try:
+            await self.navigate_to_system_mode()
+            for _ in range(20):
+                if "headers" in captured:
                     break
-                await self._fill_charge_slot(slot_idx, cycle, target_weekday)
-                slot_idx += 1
-
-            for clear_idx in range(slot_idx, 6):
-                await self._clear_slot(clear_idx)
-
-            log.info(
-                "livoltek.apply_schedule.filled",
-                cycles=len(plan.cycles),
-                stop_window=plan.stop_window is not None,
-                weekday=target_weekday,
-            )
-
-        if not save:
-            log.info("livoltek.apply_schedule.dry_run_form_filled")
-            return
-
-        if not _needs_save(plan, tou_changed=tou_changed):
-            # Nothing was touched, so the portal has no command to issue and
-            # would return no success toast. Clicking Save anyway produced a
-            # daily false `no_success_toast_seen` warning through summer, which
-            # is how a real Save failure would get overlooked.
-            log.info("livoltek.apply_schedule.nothing_to_save")
-            return
-
-        await page.get_by_role("button", name="Save Params.").first.click()
-        await self._verify_save_toast()
-        log.info("livoltek.apply_schedule.saved")
-
-    async def _verify_save_toast(self, timeout_ms: int = 8000) -> None:
-        """Wait for the green success toast after Save Params; warn otherwise.
-
-        The portal renders an `.el-message--success` toast saying
-        'The instruction was issued successfully!' when the command reaches
-        the inverter. If we don't see it, the Save click didn't actually
-        commit — log a warning so it shows up in cron output.
-        """
-        try:
-            await self.page.locator(".el-message--success").first.wait_for(
-                state="visible", timeout=timeout_ms
-            )
-            log.info("livoltek.save.toast_confirmed")
-        except PlaywrightTimeoutError:
-            log.warning("livoltek.save.no_success_toast_seen")
-
-    async def _set_tou_enabled(self, enabled: bool) -> bool:
-        """Set the ToU toggle. Returns True if the form actually changed."""
-        page = self.page
-        toggle_row = page.locator('text="Enable ToU schedule"').locator(
-            'xpath=following-sibling::*[contains(@class, "el-switch")][1]'
-        )
-        current = await toggle_row.get_attribute("aria-checked")
-        is_on = current == "true"
-        if is_on != enabled:
-            await toggle_row.click()
-            log.info("livoltek.tou_toggle.set", enabled=enabled)
-            return True
-        log.info("livoltek.tou_toggle.already", enabled=enabled)
-        return False
-
-    async def _fill_charge_slot(
-        self, slot_idx: int, cycle: CyclePair, weekday: str
-    ) -> None:
-        start_str = cycle.charge.start.astimezone(RIGA_TZ).strftime("%H:%M")
-        end_str = cycle.charge.end.astimezone(RIGA_TZ).strftime("%H:%M")
-
-        # Strategy MUST be set first — see _await_row_editable.
-        await self._select_strategy(slot_idx, "Charge")
-        await self._await_row_editable(slot_idx)
-        await self._fill_time_field("Start Time", slot_idx, start_str)
-        await self._fill_time_field("End Time", slot_idx, end_str)
-        await self._set_slot_weekday(slot_idx, weekday)
-        await self._fill_number_field("Power", slot_idx, "10.00")
-        await self._fill_number_field("SOC", slot_idx, "100")
-        log.info(
-            "livoltek.slot.filled",
-            slot=slot_idx,
-            start=start_str,
-            end=end_str,
-            weekday=weekday,
-        )
-
-    async def _fill_stop_slot(
-        self, slot_idx: int, window: TradingWindow, weekday: str
-    ) -> None:
-        """Fill one schedule row as a morning Discharge-to-grid slot.
-
-        Strategy is `Discharge` with SOC target from settings (default 15%).
-        The inverter drains the battery to grid until SOC reaches the target,
-        capturing the morning spot premium. Sunny-day gate (PV ≥ load × 1.5)
-        ensures afternoon PV will refill the battery before evening peak —
-        on cloudier days the planner skips this slot entirely.
-
-        Helper name `_fill_stop_slot` is preserved for compatibility with the
-        planner's `stop_window` field; conceptually it's the "block-and-export
-        morning window".
-        """
-        start_str = window.start.astimezone(RIGA_TZ).strftime("%H:%M")
-        end_str = window.end.astimezone(RIGA_TZ).strftime("%H:%M")
-        soc_target = str(self._settings.morning_discharge_target_soc_pct)
-
-        # Strategy MUST be set first — see _await_row_editable.
-        await self._select_strategy(slot_idx, "Discharge")
-        await self._await_row_editable(slot_idx)
-        await self._fill_time_field("Start Time", slot_idx, start_str)
-        await self._fill_time_field("End Time", slot_idx, end_str)
-        await self._set_slot_weekday(slot_idx, weekday)
-        await self._fill_number_field("Power", slot_idx, "10.00")
-        await self._fill_number_field("SOC", slot_idx, soc_target)
-        log.info(
-            "livoltek.slot.morning_discharge_filled",
-            slot=slot_idx,
-            start=start_str,
-            end=end_str,
-            weekday=weekday,
-            soc_target=soc_target,
-        )
-
-    async def _clear_slot(self, slot_idx: int) -> None:
-        await self._select_strategy(slot_idx, "Without a strategy")
-        log.info("livoltek.slot.cleared", slot=slot_idx)
-
-    async def _await_row_editable(
-        self, slot_idx: int, timeout_ms: int = 5000
-    ) -> None:
-        """Wait for a slot row's inputs to become editable after its strategy.
-
-        The portal gates each row: `Start Time`, `End Time`, `Power` and `SOC`
-        carry `disabled` until that row's Strategy is something other than
-        `Without a strategy`. The Strategy dropdowns themselves are never
-        disabled.
-
-        This is why strategy is selected FIRST. The original order filled the
-        times before the strategy, which only worked while a row happened to
-        retain a real strategy from an earlier run. `_clear_slot` sets unused
-        rows to `Without a strategy`, so once a plan had cleared rows 1-5, every
-        later multi-slot plan (or any sunny plan writing Discharge in slot 0 and
-        a Charge cycle in slot 1) silently hit a 30 s timeout on a disabled
-        input.
-        """
-        field = self.page.locator('input[placeholder="Start Time"]').nth(slot_idx)
-        try:
-            await field.wait_for(state="visible", timeout=timeout_ms)
-            await self.page.wait_for_function(
-                """([idx]) => {
-                    const els = document.querySelectorAll(
-                        'input[placeholder="Start Time"]');
-                    return els[idx] && !els[idx].disabled;
-                }""",
-                arg=[slot_idx],
-                timeout=timeout_ms,
-            )
-        except PlaywrightTimeoutError as exc:
+                await asyncio.sleep(0.5)
+        finally:
+            page.remove_listener("request", on_request)
+        if "headers" not in captured:
             raise LivoltekError(
-                f"slot {slot_idx} stayed disabled after selecting its "
-                f"strategy — the portal's row-gating rule changed. Run "
-                f"scripts/livoltek_peek_slot_gating.py to re-derive it."
-            ) from exc
+                "System mode issued no device-parameter request, so the "
+                "authorization header for the register API was not captured"
+            )
 
-    async def _fill_time_field(
-        self, placeholder: str, slot_idx: int, value: str
-    ) -> None:
-        field = self.page.locator(f'input[placeholder="{placeholder}"]').nth(slot_idx)
-        await field.click()
-        await field.fill("")
-        await field.fill(value)
-        await field.press("Tab")
-
-    async def _fill_number_field(
-        self, placeholder: str, slot_idx: int, value: str
-    ) -> None:
-        field = self.page.locator(f'input[placeholder="{placeholder}"]').nth(slot_idx)
-        await field.click()
-        await field.fill(value)
-        await field.press("Tab")
-
-    async def _select_strategy(self, slot_idx: int, label: str) -> None:
-        """Open the slot's strategy dropdown and pick an EXACT-text option.
-
-        Critical: the option list is Charge / Discharge / Stop / Without a
-        strategy. `:has-text("Charge")` is a substring match — would also
-        match "Discharge" and silently pick the wrong row. We do the exact
-        match in JS to avoid Playwright selector quirks.
-        """
-        page = self.page
-        strategy_input = page.locator(
-            'input[placeholder="Please Select "]'
-        ).nth(slot_idx)
-        await strategy_input.click()
-        await asyncio.sleep(0.3)
-        clicked = await page.evaluate(
-            """(label) => {
-                const items = Array.from(document.querySelectorAll('.el-select-dropdown__item'));
-                for (const item of items) {
-                    if (window.getComputedStyle(item).display === 'none') continue;
-                    const r = item.getBoundingClientRect();
-                    if (r.width === 0 || r.height === 0) continue;
-                    if ((item.textContent || '').trim() === label) {
-                        item.click();
-                        return true;
-                    }
-                }
-                return false;
-            }""",
-            label,
+        api = _PortalPointApi(
+            page, self.EU_HOST, captured["headers"], captured["device_id"]
         )
-        if not clicked:
-            raise LivoltekError(
-                f"strategy option '{label}' not found in dropdown for slot {slot_idx}"
-            )
-
-    async def _set_slot_weekday(self, slot_idx: int, target_weekday: str) -> None:
-        """Open the Nth slot's weekday picker and check only `target_weekday`.
-
-        The picker is a Livoltek-custom component (NOT Element UI el-checkbox):
-        each day is a `<label class="weekday-picker__checkbox-label">` wrapping
-        an `<input type="checkbox" value="0..6">` where the value matches
-        Python `datetime.weekday()` (Mon=0, Sun=6). The component's reactive
-        state only updates on real PointerEvent clicks — JS `.click()` on the
-        input or label silently toggles the DOM but doesn't propagate to Vue.
-        We use Playwright's native click() which dispatches a real event.
-        """
-        page = self.page
-        target_idx = _WEEKDAY_LABELS.index(target_weekday)
-        picker_tag = page.locator(".weekday-picker__tags").nth(slot_idx)
-        await picker_tag.click()
-        await asyncio.sleep(0.4)
-
-        dropdown = page.locator(".weekday-picker__dropdown").last
-        labels = dropdown.locator("label.weekday-picker__checkbox-label")
-        count = await labels.count()
-        if count != 7:
-            raise LivoltekError(
-                f"weekday picker for slot {slot_idx} has {count} labels, expected 7"
-            )
-
-        clicked: list[dict] = []
-        for i in range(count):
-            label_el = labels.nth(i)
-            input_el = label_el.locator('input[type="checkbox"]')
-            val_str = await input_el.get_attribute("value")
-            if val_str is None:
-                continue
-            idx = int(val_str)
-            is_checked = await input_el.is_checked()
-            want = idx == target_idx
-            if is_checked != want:
-                await label_el.click()
-                clicked.append({"idx": idx, "wasChecked": is_checked})
-                await asyncio.sleep(0.05)
-
+        device = {a: p.get("value") for a, p in (await api.read()).items()}
+        slots = slots_for_plan(
+            plan, discharge_soc_pct=self._settings.morning_discharge_target_soc_pct
+        )
+        steps = write_steps(slots, tou_on=not plan.is_empty, device=device)
         log.info(
-            "livoltek.weekday_picker.attempt",
-            slot=slot_idx,
-            target=target_weekday,
-            target_idx=target_idx,
-            clicked=clicked,
+            "livoltek.write_schedule.start",
+            steps=len(steps),
+            registers=sum(len(s) for s in steps),
+            tou_on=not plan.is_empty,
         )
-        await page.locator("body").click(position={"x": 10, "y": 200})
-        await asyncio.sleep(0.3)
+        await apply_register_steps(api, steps)
+        log.info("livoltek.write_schedule.confirmed")
+
+
+class _PortalPointApi:
+    """`PointApi` over the portal's own endpoints, using the SPA's auth header."""
+
+    def __init__(self, page: Page, host: str, headers: dict, device_id) -> None:
+        self._page = page
+        self._base = f"https://{host}{LivoltekClient.OPERATION_PATH}"
+        self._headers = headers
+        self._device_id = device_id
+
+    async def _post(self, path: str, data: dict) -> dict:
+        response = await self._page.request.post(
+            f"{self._base}/{path}", headers=self._headers, data=data, timeout=30000
+        )
+        return json.loads(await response.text()) or {}
+
+    async def read(self) -> dict[int, dict]:
+        # readCheck is what the portal's own Read Params button fires first;
+        # it asks the device for fresh values before point/info is re-read.
+        await self._post("point/readCheck", {"id": self._device_id})
+        return points_by_address(
+            await self._post("point/info", {"id": self._device_id})
+        )
+
+    async def write(self, points: list[dict]) -> None:
+        body = await self._post(
+            "remote/control", {"id": self._device_id, "points": points}
+        )
+        if body.get("msgCode") != "operate.success":
+            if "REPEAT_CONTROL" in str(body.get("message") or body.get("msg_code")):
+                raise PortalBusyError(str(body.get("message")))
+            raise LivoltekError(f"portal rejected the register write: {body}")

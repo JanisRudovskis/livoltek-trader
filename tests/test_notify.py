@@ -298,3 +298,73 @@ def test_format_error_message_has_high_priority_and_includes_type():
     assert "RuntimeError" in body
     assert "upstream timeout" in body
     assert priority == 4
+
+
+# --- EV advice ------------------------------------------------------------------
+
+
+def _ev_advice(*, hold: bool, drains_day: bool):
+    from livoltek_trader.ev import EvAdvice, EvOption
+
+    cycle = _cycle(charge_h=8, disch_h=11, charge_price=0.02, disch_price=0.20)
+    if hold:
+        # UTC 11:00 -> Riga 14:00 in May
+        cycle = cycle.model_copy(
+            update={"hold_until": datetime(2026, 5, 9, 11, 0, tzinfo=UTC)}
+        )
+    plan = DailyPlan(
+        target_date=date(2026, 5, 9),
+        cycles=[cycle],
+        skipped_reason=None,
+        total_net_profit_eur=cycle.net_profit_eur,
+    )
+    return EvAdvice(
+        options=[
+            EvOption(
+                label="nakts",
+                window=TradingWindow(
+                    start=datetime(2026, 5, 8, 23, 0, tzinfo=UTC),
+                    end=datetime(2026, 5, 9, 2, 0, tzinfo=UTC),
+                    avg_eur_per_kwh=0.041,
+                ),
+                cost_100km_eur=2.02,
+            ),
+            EvOption(
+                label="diena", window=_window(8, 11, 0.063), cost_100km_eur=2.51,
+                drains_battery=drains_day,
+            ),
+        ],
+        best=0,
+        plan=plan,
+    )
+
+
+def test_ev_windows_are_listed_with_price_and_cost_per_100km():
+    advice = _ev_advice(hold=False, drains_day=False)
+    _, body, _ = format_plan_message(advice.plan, ev=advice)
+    assert "EV" in body
+    assert "⭐ nakts 02:00-05:00" in body  # UTC 23:00 -> Riga 02:00 next day
+    assert "4.1 c/kWh" in body
+    assert "100 km €2.02" in body
+    assert "diena 11:00-14:00" in body and "100 km €2.51" in body
+
+
+def test_ev_window_that_would_empty_the_house_battery_is_flagged():
+    advice = _ev_advice(hold=False, drains_day=True)
+    _, body, _ = format_plan_message(advice.plan, ev=advice)
+    day_line = next(l for l in body.splitlines() if "diena" in l)
+    assert "baterij" in day_line
+
+
+def test_held_charge_slot_shows_its_real_end_and_why():
+    advice = _ev_advice(hold=True, drains_day=False)
+    _, body, _ = format_plan_message(advice.plan, ev=advice)
+    # Charge 11:00-13:00 Riga, held full until 14:00 for the car.
+    assert "11:00-14:00 Charge 100%" in body
+    assert "13:00" in body and "EV" in body
+
+
+def test_no_ev_section_without_advice():
+    advice = _ev_advice(hold=False, drains_day=False)
+    _, body, _ = format_plan_message(advice.plan)
+    assert "EV" not in body

@@ -5,14 +5,17 @@
 ## Arhitektūra
 
 ```
-Railway cron (22:30 UTC daily)
+Railway cron (18:00 un 19:00 UTC; strādā tikai tas, kas Rīgā ir 21:xx)
   → spin up Docker container from Dockerfile
-    → uv run livoltek-trader
+    → uv run livoltek-trader --execute --riga-hour 21
+      → (nav 21:xx Rīgā? → exit 0)
       → fetch Open-Meteo PV forecast
-      → fetch Elering Nord Pool prices
-      → plan_day → DailyPlan
-      → ntfy notification (dry-run summary OR action confirmation)
-      → IF --execute: Playwright login + apply_schedule(save=True)
+      → fetch Elering Nord Pool prices (rītdiena + šovakars EV logam)
+      → plan_day → DailyPlan → advise_ev (EV logi + mājas baterijas turēšana)
+      → ntfy notification (plāns + EV logi + 100 km cena)
+      → IF --execute: Playwright login + write_schedule
+           (ToU off → visi 6 sloti kā reģistri → ToU on; katrs solis
+            nolasīts atpakaļ no invertora, neapstiprināts → ntfy trauksme)
       → exit
   → container stops (next run at next cron tick)
 ```
@@ -55,28 +58,28 @@ TZ=Europe/Riga                       # Strukturētajos logos vēl viens timestam
 
 **Opcionāli (overrides defaults):**
 ```
-BATTERY_CAPACITY_KWH=10.24
-ROUND_TRIP_EFFICIENCY=0.90
-BATTERY_PRICE_EUR=3000
-MAX_CYCLES_PER_DAY=6
-HOURS_PER_CYCLE=2
-MIN_NET_PROFIT_PER_CYCLE_EUR=0.25
-EXPECTED_DAILY_LOAD_KWH=22.0
-PV_KWH_PER_MJ_M2=2.98
-PV_LAT=56.918
-PV_LON=24.043
+EV_CHARGE_HOURS=3                    # EV loga garums; 0 izslēdz EV ieteikumus
+EV_CONSUMPTION_KWH_PER_100KM=20.0    # ieliec auto borta datora vidējo
+EV_CHARGING_EFFICIENCY=0.90
 ```
+
+**NELIEC Railway mainīgajos baterijas konstantes** (`BATTERY_CAPACITY_KWH`,
+`ROUND_TRIP_EFFICIENCY` u.c.). Tās ir izmērītas un dzīvo `config.py`; vides
+mainīgais tās klusi pārraksta — tieši tā 2026-09-01 ražošana strādāja ar
+vecajām nameplate vērtībām. `main.start` logā redzams, kas reāli stājies spēkā.
 
 ### 3. Pārliecinies par cron grafiku
 
-`railway.json` jau satur: `"cronSchedule": "30 22 * * *"` (22:30 UTC).
+`railway.json`: `"cronSchedule": "0 18,19 * * *"` un `startCommand` ar
+`--riga-hour 21`. Railway cron saprot tikai UTC, tāpēc tas palaižas divreiz:
 
-- Vasarā (EEST UTC+3): atbilst **01:30 Rīgas laikā**
-- Ziemā (EET UTC+2): atbilst **00:30 Rīgas laikā**
+| | 18:00 UTC | 19:00 UTC |
+|---|---|---|
+| Vasarā (UTC+3) | **21:00 Rīgā → strādā** | 22:00 → exit 0 |
+| Ziemā (UTC+2) | 20:00 → exit 0 | **21:00 Rīgā → strādā** |
 
-Abos gadījumos pēc Riga local pusnakts. Tas dod laiku rīta lētajām stundām (parasti 02:00+) iestatīt schedule.
-
-Ja gribi citu laiku, mainies `railway.json` un redeploy. Cron sintakse standarta.
+Tā grafiks tiek iestatīts 21:00 pēc Rīgas laika visu gadu, bez DST
+labojumiem. Lieko palaidienu logā redz kā `main.skip_not_scheduled_hour`.
 
 ### 4. Pirmais deploy — DRY-RUN režīms
 
@@ -100,7 +103,9 @@ Alternatīvi: Railway dashboard -> Service -> Settings -> Start Command override
 
 ### 6. Manuāli palaist starpposmā
 
-Railway dashboard -> Service -> Deployments -> "Run Once" — palaiž tūlīt (neatkarīgi no cron). Noderīgs:
+Railway dashboard -> Service -> Deployments -> "Run Once" — palaiž tūlīt (neatkarīgi no cron).
+**Bet** `--riga-hour 21` liek tam uzreiz beigties, ja Rīgā nav 21:xx. Manuālam
+palaidienam citā laikā īslaicīgi noņem `--riga-hour 21` no Start Command. Noderīgs:
 - Pārbaudi pēc pirmā setup'a
 - Sūta paziņojumu pēc tava pieprasījuma
 - Testē izmaiņas
@@ -125,7 +130,7 @@ Ja Railway nav vairs piemērots:
 1. **Storage state nepersistē** starp skrējieniem. Tas ir OK — login ir ātrs, bet ja IP adrese mainās bieži, var redzēt vairāk popup uzdomāšanu Livoltek pusē.
 2. **Konteinera IP var mainīties** — Railway nesalga statisku IP. Livoltek pagaidām neierobežo, bet ja sāk, pārvieto.
 3. **Bezmaksas tier ierobežojumi** — Railway free trial ir $5/mēn. Mūsu skrējiens ~1 min/dienā = nieks (<$0.10/mēn pat brīvajam). Bet image storage ~1GB var pievienot vēl 10-50¢/mēn.
-4. **DST pāreja** — cron paliek UTC. Riga local time mainās 2× gadā. Skrējiena laiks var nokrist neērti tieši DST naktī.
+4. **DST pāreja** — atrisināta ar divām UTC stundām + `--riga-hour 21` (skat. 3. soli).
 
 ## Atjaunināt deployment
 

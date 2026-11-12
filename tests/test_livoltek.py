@@ -7,13 +7,16 @@ These tests just cover what we can without launching a browser.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
-
 import pytest
 
 from livoltek_trader.config import Settings
-from livoltek_trader.livoltek import LivoltekClient, LivoltekError, _needs_save
-from livoltek_trader.strategy import DailyPlan, TradingWindow
+from livoltek_trader.livoltek import (
+    LivoltekClient,
+    LivoltekError,
+    PortalBusyError,
+    apply_register_steps,
+    points_by_address,
+)
 
 
 def test_url_fragments_match_real_portal_paths():
@@ -41,45 +44,115 @@ async def test_login_raises_when_credentials_missing():
         await client.login()
 
 
-def _plan(*, empty: bool) -> DailyPlan:
-    if empty:
-        return DailyPlan(
-            target_date=date(2026, 9, 3),
-            cycles=[],
-            skipped_reason="PV covers the day",
-            total_net_profit_eur=0.0,
-        )
-    window = TradingWindow(
-        start=datetime(2026, 9, 3, 4, tzinfo=timezone.utc),
-        end=datetime(2026, 9, 3, 6, tzinfo=timezone.utc),
-        avg_eur_per_kwh=0.05,
-    )
-    return DailyPlan(
-        target_date=date(2026, 9, 3),
-        cycles=[],
-        skipped_reason=None,
-        total_net_profit_eur=0.0,
-        stop_window=window,
-    )
+class _FakeInverter:
+    """Behaves like the real device as measured on 2026-11-12: a write is
+    accepted at once, but its registers land ONE PER POLL, in order. Optionally
+    drops some registers entirely, as the 2026-11-05 write did."""
+
+    def __init__(
+        self, values: dict[int, str], drop: set[int] = frozenset(), busy: int = 0
+    ) -> None:
+        self.values = dict(values)
+        self.queue: list[tuple[int, object]] = []
+        self.drop = set(drop)
+        self.busy = busy  # this many writes are refused as "too soon"
+        self.writes: list[dict[int, object]] = []
+
+    def _definitions(self) -> dict[int, dict]:
+        return {
+            a: {"address": str(a), "pointName": f"reg {a}", "value": v}
+            for a, v in self.values.items()
+        }
+
+    async def read(self) -> dict[int, dict]:
+        if self.queue:
+            addr, value = self.queue.pop(0)
+            if addr not in self.drop:
+                self.values[addr] = str(value)
+        return self._definitions()
+
+    async def write(self, points: list[dict]) -> None:
+        if self.busy:
+            self.busy -= 1
+            raise PortalBusyError("POINT_REPEAT_CONTROL_IN_SHORT_TIME")
+        self.writes.append({int(p["address"]): p["value"] for p in points})
+        self.queue.extend((int(p["address"]), p["value"]) for p in points)
 
 
-def test_needs_save_when_slots_were_written():
-    assert _needs_save(_plan(empty=False), tou_changed=False) is True
+async def _no_sleep(_s: float) -> None:
+    return None
 
 
-def test_needs_save_when_the_tou_toggle_was_flipped():
-    assert _needs_save(_plan(empty=True), tou_changed=True) is True
+async def test_each_step_is_confirmed_on_the_device_before_the_next():
+    dev = _FakeInverter({45093: "170", 45009: "170", 45016: "8"})
+    steps = [{45093: 85}, {45009: 204, 45016: 0}, {45093: 170}]
+    await apply_register_steps(dev, steps, sleep=_no_sleep)
+    assert dev.writes == steps
+    assert dev.values == {45093: "170", 45009: "204", 45016: "0"}
 
 
-def test_no_save_when_an_empty_plan_changed_nothing():
-    """An empty plan on a day ToU is already off leaves the form untouched.
+async def test_a_register_that_never_lands_raises_and_stops_the_sequence():
+    """A dropped slot register must not be followed by ToU ON: the device is
+    left with ToU off — plain Self-use, the safe state — and the error names
+    the register so the ntfy alarm says what failed."""
+    dev = _FakeInverter({45093: "170", 45009: "170", 45016: "8"}, drop={45016})
+    steps = [{45093: 85}, {45009: 204, 45016: 0}, {45093: 170}]
+    with pytest.raises(LivoltekError, match="45016"):
+        await apply_register_steps(dev, steps, sleep=_no_sleep, max_polls=6)
+    assert dev.writes == steps[:2]
+    assert dev.values[45093] == "85"
 
-    Clicking Save then produces no success toast, because the portal has
-    nothing to issue — which fired `livoltek.save.no_success_toast_seen` every
-    such night. A warning that cries wolf daily trains everyone to ignore it,
-    so it must not fire when there was genuinely nothing to save.
-    """
-    assert _needs_save(_plan(empty=True), tou_changed=False) is False
+
+async def test_written_points_reuse_the_device_definitions_with_new_values():
+    # remote/control takes the full point objects from point/info.
+    dev = _FakeInverter({45093: "85"})
+    await apply_register_steps(dev, [{45093: 170}], sleep=_no_sleep)
+    assert dev.writes == [{45093: 170}]
+
+
+async def test_a_write_refused_as_too_soon_is_retried_after_a_wait():
+    """The portal refuses a command that follows the previous one within
+    ~10 s (POINT_REPEAT_CONTROL_IN_SHORT_TIME, measured 2026-11-12). A fast
+    confirmation makes ToU-off -> slots -> ToU-on hit that, so wait and retry."""
+    dev = _FakeInverter({45093: "85", 45009: "204"}, busy=2)
+    slept: list[float] = []
+
+    async def sleep(s: float) -> None:
+        slept.append(s)
+
+    await apply_register_steps(dev, [{45009: 170}, {45093: 170}], sleep=sleep)
+    assert dev.writes == [{45009: 170}, {45093: 170}]
+    assert dev.values == {45093: "170", 45009: "170"}
+    assert slept.count(15.0) >= 2
+
+
+async def test_a_portal_that_stays_busy_fails_without_turning_tou_on():
+    dev = _FakeInverter({45093: "85", 45009: "204"}, busy=10_000)
+    with pytest.raises(LivoltekError, match="busy"):
+        await apply_register_steps(dev, [{45009: 170}, {45093: 170}], sleep=_no_sleep)
+    assert dev.writes == [] and dev.values[45093] == "85"
+
+
+def test_points_by_address_finds_points_nested_anywhere_in_point_info():
+    payload = {
+        "data": [
+            {"groupName": "ToU", "children": [
+                {"address": "45093", "pointName": "TOU enable", "value": "85"},
+                {"address": None, "pointName": "computed", "value": "x"},
+            ]},
+            {"list": [{"address": "45009", "pointName": "Time 1 cmd", "value": "170"}]},
+        ]
+    }
+    found = points_by_address(payload)
+    assert sorted(found) == [45009, 45093]
+    assert found[45093]["value"] == "85"
+
+
+async def test_writing_an_unknown_register_is_refused_before_anything_is_sent():
+    dev = _FakeInverter({45093: "85"})
+    with pytest.raises(LivoltekError, match="99999"):
+        await apply_register_steps(dev, [{99999: 1}], sleep=_no_sleep)
+    assert dev.writes == []
 
 
 def test_page_raises_before_context_entry():

@@ -2,12 +2,14 @@
 
 Usage:
     livoltek-trader                       # dry-run for TOMORROW (Riga local)
-    livoltek-trader --execute             # full pipeline with portal Save
+    livoltek-trader --execute             # full pipeline, writes the inverter
     livoltek-trader --date 2026-05-12     # plan for a specific date
+    livoltek-trader --execute --riga-hour 21   # what the Railway cron runs
 
-Default target is the next calendar day in Riga local time — we run the
-cron at 22:30 Riga the evening before, so by then Nord Pool has published
-tomorrow's prices and the trader can write the schedule to the inverter.
+Default target is the next calendar day in Riga local time. The schedule is
+set at 21:00 Riga all year: Railway cron only speaks UTC, so it fires at
+18:00 and 19:00 UTC and `--riga-hour 21` makes the run that is NOT at 21:xx
+Riga exit immediately. Nord Pool publishes tomorrow's prices by ~14:00.
 
 Default is dry-run for safety. `--execute` is required to actually push the
 schedule to the inverter.
@@ -27,6 +29,7 @@ RIGA_TZ = ZoneInfo("Europe/Riga")
 
 from livoltek_trader.config import Settings, get_settings
 from livoltek_trader.elering import ElerinAPIError, fetch_day_ahead
+from livoltek_trader.ev import advise_ev
 from livoltek_trader.livoltek import LivoltekClient
 from livoltek_trader.notify import (
     NtfyClient,
@@ -66,18 +69,27 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Push schedule to the inverter. Without this flag, the run is "
         "dry-run only (plan computed, ntfy sent, no portal contact).",
     )
+    p.add_argument(
+        "--riga-hour",
+        type=int,
+        default=None,
+        help="Only run if the Riga local hour is this; otherwise exit 0. "
+        "Lets a UTC cron firing at two hours hit one Riga hour across DST.",
+    )
     return p.parse_args(argv)
+
+
+def _now_riga() -> datetime:
+    return datetime.now(RIGA_TZ)
 
 
 def _default_target_date() -> date:
     """Tomorrow's calendar date in Riga local time.
 
-    The cron fires at 22:30 Riga (~19:30 UTC summer). By then Nord Pool
-    has published the next day's prices, so we plan for tomorrow. Use
-    Riga local — not UTC — so a 22:30 Riga run during DST doesn't
-    accidentally pick "today" via UTC's rollover lagging Riga's.
+    Riga local, not UTC, so an evening run never picks "today" through UTC's
+    later rollover.
     """
-    return (datetime.now(RIGA_TZ).date() + timedelta(days=1))
+    return _now_riga().date() + timedelta(days=1)
 
 
 async def _try_notify(ntfy: NtfyClient, *args, **kwargs) -> None:
@@ -94,6 +106,15 @@ async def _try_notify(ntfy: NtfyClient, *args, **kwargs) -> None:
 
 
 async def _run(args: argparse.Namespace, settings: Settings) -> int:
+    riga_hour = getattr(args, "riga_hour", None)
+    if riga_hour is not None and _now_riga().hour != riga_hour:
+        log.info(
+            "main.skip_not_scheduled_hour",
+            riga_now=_now_riga().isoformat(timespec="minutes"),
+            riga_hour=riga_hour,
+        )
+        return 0
+
     target_date = (
         date.fromisoformat(args.date) if args.date else _default_target_date()
     )
@@ -190,11 +211,27 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         measured_daily_load_kwh=measured_load,
         displaceable_kwh=displaceable,
     )
+
+    # Tonight's remaining hours (the run lands ~21:00) belong to the EV night
+    # window. Optional: without them the night window starts at midnight.
+    tonight: list = []
+    try:
+        tonight = aggregate_hourly(
+            await fetch_day_ahead(target_date - timedelta(days=1), settings=settings)
+        )
+    except ElerinAPIError as exc:
+        log.warning("main.tonight_prices_failed", error=str(exc))
+    ev = advise_ev(plan, tonight + hourly, settings, displaceable_kwh=displaceable)
+    plan = ev.plan  # may carry a battery hold across the recommended EV window
     log.info(
         "main.plan_ready",
         cycles=len(plan.cycles),
         net=plan.total_net_profit_eur,
         skipped=plan.skipped_reason,
+        held=[c.hold_until.isoformat() for c in plan.cycles if c.hold_until],
+        ev_best=(
+            ev.options[ev.best].window.start.isoformat() if ev.options else None
+        ),
     )
 
     title, body, tags = format_plan_message(
@@ -203,6 +240,7 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
         hourly_prices=hourly,
         settings=settings,
         yesterday=latest,
+        ev=ev,
     )
     if not args.execute:
         title = f"[DRY-RUN] {title}"
@@ -215,8 +253,7 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
     try:
         async with LivoltekClient(settings) as client:
             await client.login()
-            await client.navigate_to_system_mode()
-            await client.apply_schedule(plan, save=True)
+            await client.write_schedule(plan)
     except Exception as exc:
         # Catch broadly: Playwright timeouts, network errors, etc. inherit from
         # Exception but NOT from LivoltekError. Without this catch they would

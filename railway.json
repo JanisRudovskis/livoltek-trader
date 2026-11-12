@@ -5,8 +5,8 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "startCommand": "uv run livoltek-trader --execute",
-    "cronSchedule": "30 19 * * *",
+    "startCommand": "uv run livoltek-trader --execute --riga-hour 21",
+    "cronSchedule": "0 18,19 * * *",
     "restartPolicyType": "NEVER"
   }
 }

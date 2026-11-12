@@ -69,6 +69,12 @@ class CyclePair(BaseModel):
     `gross_revenue_eur` is operating profit before wear — the formula nets out
     the purchase cost, so despite the name it is not a revenue figure. Kept
     for field compatibility; see `_build_cycle`.
+
+    `hold_until`, when set, extends the written Charge slot past the end of
+    the charge. Once the battery is full a Charge slot holds it there while
+    the house runs from the grid, so this keeps the stored energy back for
+    later, dearer hours — used to stop an EV session from draining the
+    battery at night prices (see `ev.sync_battery_hold`).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -78,6 +84,7 @@ class CyclePair(BaseModel):
     gross_revenue_eur: float
     wear_cost_eur: float
     net_profit_eur: float
+    hold_until: datetime | None = None
 
 
 class DailyPlan(BaseModel):

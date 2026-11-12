@@ -23,7 +23,7 @@ def settings() -> Settings:
 
 @pytest.fixture
 def args() -> argparse.Namespace:
-    return argparse.Namespace(date="2026-12-15", execute=False)
+    return argparse.Namespace(date="2026-12-15", execute=False, riga_hour=None)
 
 
 def _periods() -> list[PricePeriod]:
@@ -67,6 +67,8 @@ class _StubPortal:
     def __init__(self, totals=None, fail: bool = False) -> None:
         self.totals = totals if totals is not None else []
         self.fail = fail
+        self.write_fail: Exception | None = None
+        self.written: list = []
 
     async def __aenter__(self):
         return self
@@ -82,6 +84,11 @@ class _StubPortal:
         if self.fail:
             raise RuntimeError("portal unreachable")
         return list(self.totals)
+
+    async def write_schedule(self, plan) -> None:
+        if self.write_fail is not None:
+            raise self.write_fail
+        self.written.append(plan)
 
 
 @pytest.fixture(autouse=True)
@@ -285,3 +292,118 @@ async def test_run_aborts_when_price_fetch_fails(
     assert rc == 1
     assert stub_ntfy.sent, "an error notification must be sent"
     assert stub_ntfy.sent[0][2] == 4, "error notifications use priority 4"
+
+
+# --- 21:00 Riga, all year -------------------------------------------------------
+
+
+def _pv_ok():
+    async def pv(*_a, **_kw):
+        return PvForecast(
+            target_date=date(2026, 12, 15),
+            expected_kwh=2.0,
+            shortwave_radiation_mj_m2=0.7,
+            sunshine_hours=1.0,
+            cloud_cover_pct=90.0,
+        )
+
+    return pv
+
+
+async def test_scheduled_run_outside_its_riga_hour_does_nothing(
+    monkeypatch, args, settings, stub_ntfy
+):
+    """Railway cron is UTC-only, so the job fires at 18:00 AND 19:00 UTC and
+    only the one that lands at 21:xx Riga — summer or winter — does work."""
+    fetched = []
+
+    async def prices(d, **_kw):
+        fetched.append(d)
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    monkeypatch.setattr(
+        main_mod, "_now_riga", lambda: datetime(2026, 12, 14, 20, 0, tzinfo=main_mod.RIGA_TZ)
+    )
+    args.riga_hour = 21
+    rc = await main_mod._run(args, settings)
+    assert rc == 0
+    assert fetched == [] and stub_ntfy.sent == []
+
+
+async def test_scheduled_run_inside_its_riga_hour_plans(
+    monkeypatch, args, settings, stub_ntfy
+):
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", _pv_ok())
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    monkeypatch.setattr(
+        main_mod, "_now_riga", lambda: datetime(2026, 12, 14, 21, 3, tzinfo=main_mod.RIGA_TZ)
+    )
+    args.riga_hour = 21
+    assert await main_mod._run(args, settings) == 0
+    assert stub_ntfy.sent
+
+
+# --- writing the schedule and EV advice ----------------------------------------------
+
+
+async def test_execute_writes_the_plan_through_the_register_api(
+    monkeypatch, args, settings, stub_ntfy, no_real_portal
+):
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", _pv_ok())
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    args.execute = True
+    assert await main_mod._run(args, settings) == 0
+    assert len(no_real_portal.written) == 1
+    assert no_real_portal.written[0].target_date == date(2026, 12, 15)
+
+
+async def test_unconfirmed_write_sends_an_alarm(
+    monkeypatch, args, settings, stub_ntfy, no_real_portal
+):
+    from livoltek_trader.livoltek import LivoltekError
+
+    async def prices(*_a, **_kw):
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", _pv_ok())
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    no_real_portal.write_fail = LivoltekError("inverter did not confirm registers [45016]")
+    args.execute = True
+    assert await main_mod._run(args, settings) == 1
+    title, body, prio = stub_ntfy.sent[-1]
+    assert prio == 4 and "45016" in body
+
+
+async def test_message_carries_ev_advice_using_tonights_prices_too(
+    monkeypatch, args, settings, stub_ntfy
+):
+    fetched = []
+
+    async def prices(d, **_kw):
+        fetched.append(d)
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", _pv_ok())
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    assert await main_mod._run(args, settings) == 0
+    assert date(2026, 12, 14) in fetched, "tonight's prices feed the night window"
+    assert "EV uzlāde" in stub_ntfy.sent[0][1]
+
+
+async def test_tonights_prices_are_optional(monkeypatch, args, settings, stub_ntfy):
+    async def prices(d, **_kw):
+        if d == date(2026, 12, 14):
+            raise ElerinAPIError("today unavailable")
+        return _periods()
+
+    monkeypatch.setattr(main_mod, "fetch_pv_forecast", _pv_ok())
+    monkeypatch.setattr(main_mod, "fetch_day_ahead", prices)
+    assert await main_mod._run(args, settings) == 0
+    assert stub_ntfy.sent
